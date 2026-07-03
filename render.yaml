@@ -3,5 +3,5 @@ services:
     name: my-first-api
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app  # ← اینجا رو عوض کن
+    startCommand: gunicorn main:app    
     plan: free
