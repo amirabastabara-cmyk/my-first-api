@@ -1,6 +1,7 @@
 import os
+import requests
 from flask import Flask, request, jsonify
-from ddgs import DDGS  # کتابخانه جدید برای جستجو
+from ddgs import DDGS
 
 app = Flask(__name__)
 
@@ -9,10 +10,8 @@ def search_web(query):
     """جستجوی عبارت در وب و برگرداندن نتایج"""
     try:
         with DDGS() as ddgs:
-            # جستجو و دریافت ۳ نتیجه اول
             results = list(ddgs.text(query, max_results=3))
             if results:
-                # ساخت یک خلاصه از نتایج
                 summary = "\n".join([f"{r['title']}: {r['body']}" for r in results])
                 return summary
             else:
@@ -40,7 +39,7 @@ def ask():
         "source": "duckduckgo"
     })
 
-# ========== مسیرهای دیگر (پینگ، صفحه اصلی و...) ==========
+# ========== مسیرهای دیگر ==========
 @app.route('/')
 def home():
     return jsonify({"message": "ربات جستجوگر با DuckDuckGo آماده است!", "status": "online"})
