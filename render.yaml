@@ -1,7 +1,10 @@
 services:
   - type: web
-    name: my-first-api
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app    
+    name: voidvision-server
+    runtime: python
+    buildCommand: ""
+    startCommand: python server.py
     plan: free
+    envVars:
+      - key: PORT
+        value: 10000
