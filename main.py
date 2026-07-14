@@ -6,10 +6,24 @@ from websockets.server import WebSocketServerProtocol
 
 connected_users = {}  # {username: websocket}
 
+async def health_check(websocket, path):
+    """پاسخ به درخواست‌های HTTP Health Check از Render"""
+    if path == "/healthz":
+        await websocket.send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+        await websocket.close()
+        return True
+    return False
+
 async def handler(websocket: WebSocketServerProtocol, path: str):
+    # ===== اگر درخواست HTTP بود، پاسخ OK بده =====
+    if path == "/healthz":
+        await websocket.send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+        await websocket.close()
+        return
+
     username = None
     try:
-        # اولین پیام را دریافت کن
+        # دریافت اطلاعات لاگین
         data = await websocket.recv()
         login_data = json.loads(data)
 
@@ -93,14 +107,13 @@ async def send_user_list(username):
 async def main():
     port = int(os.environ.get("PORT", 10000))
     print("=" * 50)
-    print("🚀 VOIDVISION GAME SERVER (WebSocket + HTTP Health Check)")
+    print("🚀 VOIDVISION GAME SERVER (WebSocket + Health Check)")
     print("=" * 50)
 
-    # ===== یک سرور واحد که هم WebSocket و هم HTTP ساده را قبول کند =====
-    async with websockets.serve(handler, "", port, compression=None) as server:
-        print(f"✅ Server started on port {port}")
+    async with websockets.serve(handler, "", port):
+        print(f"✅ WebSocket server started on port {port}")
         print("🟢 Waiting for connections...")
-        await server.wait_closed()
+        await asyncio.Future()  # اجرای بی‌نهایت
 
 if __name__ == "__main__":
     asyncio.run(main())
