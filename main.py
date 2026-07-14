@@ -6,10 +6,11 @@ import sys
 import os
 
 class GameServer:
-    def __init__(self, host='0.0.0.0', port=5000):
+    # تغییر: host رو به '' تغییر دادیم و port رو از پارامتر می‌گیره
+    def __init__(self, host='', port=5000):
         self.host = host
         self.port = port
-        self.clients = {}  # {username: socket}
+        self.clients = {}
         self.lock = threading.Lock()
         
     def start(self):
@@ -167,12 +168,10 @@ if __name__ == "__main__":
     print("🚀 VOIDVISION GAME SERVER")
     print("="*50)
     
-    port = 5000
-    if len(sys.argv) > 1:
-        try:
-            port = int(sys.argv[1])
-        except:
-            pass
+    # ===== تغییر مهم برای Render =====
+    # پورت رو از محیط (Environment) بگیر، اگر نبود از ۱۰۰۰۰ استفاده کن
+    port = int(os.environ.get("PORT", 10000))
     
-    server = GameServer(port=port)
+    # host رو خالی بذار تا روی همه آدرس‌ها گوش بده
+    server = GameServer(host='', port=port)
     server.start()
