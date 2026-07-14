@@ -1,171 +1,103 @@
-import socket
-import threading
+import asyncio
 import json
-import sys
 import os
-import time
+import websockets
 
-class GameServer:
-    def __init__(self, host='', port=5000):
-        self.host = host
-        self.port = port
-        self.clients = {}
-        self.lock = threading.Lock()
+connected_users = {}  # {username: websocket}
 
-    def start(self):
-        try:
-            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind((self.host, self.port))
-            server.listen(50)
-            print(f"✅ Server started on {self.host}:{self.port}")
-            print("🟢 Waiting for connections...")
-            print("=" * 50)
+async def handler(websocket, path):
+    username = None
+    try:
+        # دریافت اطلاعات لاگین
+        data = await websocket.recv()
+        login_data = json.loads(data)
 
-            while True:
-                client_socket, address = server.accept()
-                threading.Thread(target=self.handle_client, args=(client_socket,), daemon=True).start()
-        except KeyboardInterrupt:
-            print("\n🛑 Server shutting down...")
-            sys.exit(0)
-        except Exception as e:
-            print(f"❌ Server error: {e}")
-            sys.exit(1)
-
-    def handle_client(self, client_socket):
-        username = None
-        try:
-            # خواندن داده اولیه (حداکثر 1024 بایت)
-            data = client_socket.recv(1024)
-            if not data:
+        if login_data.get("type") == "login":
+            username = login_data.get("username", "").strip()
+            if not username:
+                await websocket.send(json.dumps({"type": "error", "message": "Invalid username!"}))
                 return
 
-            # 🔥 اگر درخواست HTTP بود، پاسخ OK بده
-            if data.startswith(b'GET') or data.startswith(b'POST') or data.startswith(b'HEAD'):
-                response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
-                client_socket.send(response)
-                client_socket.close()
-                print("✅ Responded to HTTP health check")
+            if username in connected_users:
+                await websocket.send(json.dumps({"type": "error", "message": "Username already taken!"}))
                 return
 
-            # تبدیل داده به رشته برای پردازش JSON
-            try:
-                data_str = data.decode('utf-8')
-            except:
-                client_socket.close()
-                return
+            connected_users[username] = websocket
+            await websocket.send(json.dumps({"type": "login_response", "status": "success"}))
+            print(f"✅ User '{username}' connected (Total: {len(connected_users)})")
+            await broadcast_user_list()
 
-            login_data = json.loads(data_str)
-
-            if login_data.get("type") == "login":
-                username = login_data.get("username", "").strip()
-                if not username:
-                    client_socket.send(json.dumps({
-                        "type": "error",
-                        "message": "Invalid username!"
-                    }).encode())
-                    client_socket.close()
-                    return
-
-                with self.lock:
-                    if username in self.clients:
-                        client_socket.send(json.dumps({
-                            "type": "error",
-                            "message": "Username already taken!"
-                        }).encode())
-                        client_socket.close()
-                        return
-                    self.clients[username] = client_socket
-
-                client_socket.send(json.dumps({
-                    "type": "login_response",
-                    "status": "success"
-                }).encode())
-
-                print(f"✅ User '{username}' connected (Total: {len(self.clients)})")
-                self.broadcast_user_list()
-
-                while True:
-                    try:
-                        data = client_socket.recv(4096)
-                        if not data:
-                            break
-                        message = json.loads(data.decode())
-                        self.process_message(username, message)
-                    except json.JSONDecodeError:
-                        continue
-                    except Exception as e:
-                        print(f"⚠️ Error processing message from {username}: {e}")
-                        break
-        except Exception as e:
-            print(f"⚠️ Error handling client: {e}")
-        finally:
-            if username:
-                with self.lock:
-                    if username in self.clients:
-                        del self.clients[username]
-                self.broadcast_user_list()
-                print(f"❌ User '{username}' disconnected (Total: {len(self.clients)})")
-            try:
-                client_socket.close()
-            except:
-                pass
-
-    def process_message(self, sender, message):
-        msg_type = message.get("type")
-        if msg_type == "chat_message":
-            self.broadcast({
-                "type": "chat_message",
-                "sender": sender,
-                "message": message.get("message", "")
-            }, exclude=sender)
-            print(f"💬 [{sender}]: {message.get('message', '')}")
-        elif msg_type == "game_invite":
-            target = message.get("target")
-            if target and target in self.clients:
+            # حلقه دریافت پیام‌ها
+            async for message in websocket:
                 try:
-                    self.clients[target].send(json.dumps({
-                        "type": "game_invite",
-                        "sender": sender,
-                        "game_name": message.get("game_name", "Unknown Game")
-                    }).encode())
-                    print(f"🎮 {sender} invited {target} to play {message.get('game_name', 'Unknown Game')}")
-                except:
-                    pass
-        elif msg_type == "get_users":
-            self.send_user_list(sender)
+                    msg = json.loads(message)
+                    await process_message(username, msg)
+                except json.JSONDecodeError:
+                    continue
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        if username and username in connected_users:
+            del connected_users[username]
+            await broadcast_user_list()
+            print(f"❌ User '{username}' disconnected (Total: {len(connected_users)})")
 
-    def broadcast(self, data, exclude=None):
-        with self.lock:
-            for username, client_socket in self.clients.items():
-                if username != exclude:
-                    try:
-                        client_socket.send(json.dumps(data).encode())
-                    except:
-                        pass
-
-    def broadcast_user_list(self):
-        users = list(self.clients.keys())
-        self.broadcast({
-            "type": "user_list",
-            "users": users
-        })
-        print(f"👥 Online users: {', '.join(users) if users else 'None'}")
-
-    def send_user_list(self, username):
-        if username in self.clients:
+async def process_message(sender, message):
+    msg_type = message.get("type")
+    if msg_type == "chat_message":
+        await broadcast({
+            "type": "chat_message",
+            "sender": sender,
+            "message": message.get("message", "")
+        }, exclude=sender)
+        print(f"💬 [{sender}]: {message.get('message', '')}")
+    elif msg_type == "game_invite":
+        target = message.get("target")
+        if target and target in connected_users:
             try:
-                self.clients[username].send(json.dumps({
-                    "type": "user_list",
-                    "users": list(self.clients.keys())
-                }).encode())
+                await connected_users[target].send(json.dumps({
+                    "type": "game_invite",
+                    "sender": sender,
+                    "game_name": message.get("game_name", "Unknown Game")
+                }))
+                print(f"🎮 {sender} invited {target} to play {message.get('game_name', 'Unknown Game')}")
             except:
                 pass
+    elif msg_type == "get_users":
+        await send_user_list(sender)
+
+async def broadcast(data, exclude=None):
+    for username, ws in connected_users.items():
+        if username != exclude:
+            try:
+                await ws.send(json.dumps(data))
+            except:
+                pass
+
+async def broadcast_user_list():
+    users = list(connected_users.keys())
+    await broadcast({"type": "user_list", "users": users})
+    print(f"👥 Online users: {', '.join(users) if users else 'None'}")
+
+async def send_user_list(username):
+    if username in connected_users:
+        try:
+            await connected_users[username].send(json.dumps({
+                "type": "user_list",
+                "users": list(connected_users.keys())
+            }))
+        except:
+            pass
+
+async def main():
+    port = int(os.environ.get("PORT", 10000))
+    print("=" * 50)
+    print("🚀 VOIDVISION GAME SERVER (WebSocket)")
+    print("=" * 50)
+    async with websockets.serve(handler, "", port):
+        print(f"✅ WebSocket server started on port {port}")
+        print("🟢 Waiting for connections...")
+        await asyncio.Future()  # اجرای بی‌نهایت
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("🚀 VOIDVISION GAME SERVER")
-    print("=" * 50)
-    port = int(os.environ.get("PORT", 10000))
-    server = GameServer(host='', port=port)
-    server.start()
+    asyncio.run(main())
