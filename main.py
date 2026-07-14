@@ -1,18 +1,16 @@
 import socket
 import threading
 import json
-import time
 import sys
 import os
 
 class GameServer:
-    # تغییر: host رو به '' تغییر دادیم و port رو از پارامتر می‌گیره
     def __init__(self, host='', port=5000):
         self.host = host
         self.port = port
         self.clients = {}
         self.lock = threading.Lock()
-        
+
     def start(self):
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -21,35 +19,35 @@ class GameServer:
             server.listen(50)
             print(f"✅ Server started on {self.host}:{self.port}")
             print("🟢 Waiting for connections...")
-            print("="*50)
-            
+            print("=" * 50)
             while True:
-                try:
-                    client_socket, address = server.accept()
-                    print(f"📥 New connection from {address}")
-                    threading.Thread(target=self.handle_client, args=(client_socket,), daemon=True).start()
-                except Exception as e:
-                    print(f"❌ Error accepting connection: {e}")
-                    
+                client_socket, address = server.accept()
+                threading.Thread(target=self.handle_client, args=(client_socket,), daemon=True).start()
         except KeyboardInterrupt:
             print("\n🛑 Server shutting down...")
             sys.exit(0)
         except Exception as e:
             print(f"❌ Server error: {e}")
             sys.exit(1)
-    
+
     def handle_client(self, client_socket):
         username = None
         try:
-            data = client_socket.recv(1024).decode()
+            # دریافت داده اولیه
+            data = client_socket.recv(1024).decode(errors='ignore')
             if not data:
                 return
-                
+
+            # 🔥 ترفند مهم برای Render: اگر درخواست HTTP بود، پاسخ OK بده
+            if data.strip().startswith(('GET', 'POST', 'HTTP')):
+                client_socket.send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                client_socket.close()
+                return
+
+            # بقیه کدهای لاگین و پردازش پیام (همان کدهای قبلی)
             login_data = json.loads(data)
-            
             if login_data.get("type") == "login":
                 username = login_data.get("username", "").strip()
-                
                 if not username:
                     client_socket.send(json.dumps({
                         "type": "error",
@@ -57,7 +55,7 @@ class GameServer:
                     }).encode())
                     client_socket.close()
                     return
-                
+
                 with self.lock:
                     if username in self.clients:
                         client_socket.send(json.dumps({
@@ -66,36 +64,30 @@ class GameServer:
                         }).encode())
                         client_socket.close()
                         return
-                    
                     self.clients[username] = client_socket
-                
+
                 client_socket.send(json.dumps({
                     "type": "login_response",
                     "status": "success"
                 }).encode())
-                
+
                 print(f"✅ User '{username}' connected (Total: {len(self.clients)})")
-                
                 self.broadcast_user_list()
-                
+
                 while True:
                     try:
                         data = client_socket.recv(4096)
                         if not data:
                             break
-                        
                         message = json.loads(data.decode())
                         self.process_message(username, message)
-                        
                     except json.JSONDecodeError:
                         continue
                     except Exception as e:
                         print(f"⚠️ Error processing message from {username}: {e}")
                         break
-                        
         except Exception as e:
             print(f"⚠️ Error handling client {username}: {e}")
-            
         finally:
             if username:
                 with self.lock:
@@ -103,15 +95,14 @@ class GameServer:
                         del self.clients[username]
                 self.broadcast_user_list()
                 print(f"❌ User '{username}' disconnected (Total: {len(self.clients)})")
-            
             try:
                 client_socket.close()
             except:
                 pass
-    
+
+    # توابع process_message, broadcast, broadcast_user_list, send_user_list رو همون‌طور که قبلاً بود، اینجا قرار بده
     def process_message(self, sender, message):
         msg_type = message.get("type")
-        
         if msg_type == "chat_message":
             self.broadcast({
                 "type": "chat_message",
@@ -119,7 +110,6 @@ class GameServer:
                 "message": message.get("message", "")
             }, exclude=sender)
             print(f"💬 [{sender}]: {message.get('message', '')}")
-            
         elif msg_type == "game_invite":
             target = message.get("target")
             if target and target in self.clients:
@@ -132,10 +122,9 @@ class GameServer:
                     print(f"🎮 {sender} invited {target} to play {message.get('game_name', 'Unknown Game')}")
                 except:
                     pass
-                    
         elif msg_type == "get_users":
             self.send_user_list(sender)
-    
+
     def broadcast(self, data, exclude=None):
         with self.lock:
             for username, client_socket in self.clients.items():
@@ -144,7 +133,7 @@ class GameServer:
                         client_socket.send(json.dumps(data).encode())
                     except:
                         pass
-    
+
     def broadcast_user_list(self):
         users = list(self.clients.keys())
         self.broadcast({
@@ -152,7 +141,7 @@ class GameServer:
             "users": users
         })
         print(f"👥 Online users: {', '.join(users) if users else 'None'}")
-    
+
     def send_user_list(self, username):
         if username in self.clients:
             try:
@@ -164,14 +153,9 @@ class GameServer:
                 pass
 
 if __name__ == "__main__":
-    print("="*50)
+    print("=" * 50)
     print("🚀 VOIDVISION GAME SERVER")
-    print("="*50)
-    
-    # ===== تغییر مهم برای Render =====
-    # پورت رو از محیط (Environment) بگیر، اگر نبود از ۱۰۰۰۰ استفاده کن
+    print("=" * 50)
     port = int(os.environ.get("PORT", 10000))
-    
-    # host رو خالی بذار تا روی همه آدرس‌ها گوش بده
     server = GameServer(host='', port=port)
     server.start()
