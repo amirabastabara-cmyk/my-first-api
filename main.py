@@ -3,6 +3,7 @@ import threading
 import json
 import sys
 import os
+import time
 
 class GameServer:
     def __init__(self, host='', port=5000):
@@ -20,6 +21,7 @@ class GameServer:
             print(f"✅ Server started on {self.host}:{self.port}")
             print("🟢 Waiting for connections...")
             print("=" * 50)
+
             while True:
                 client_socket, address = server.accept()
                 threading.Thread(target=self.handle_client, args=(client_socket,), daemon=True).start()
@@ -33,19 +35,28 @@ class GameServer:
     def handle_client(self, client_socket):
         username = None
         try:
-            # دریافت داده اولیه
-            data = client_socket.recv(1024).decode(errors='ignore')
+            # خواندن داده اولیه (حداکثر 1024 بایت)
+            data = client_socket.recv(1024)
             if not data:
                 return
 
-            # 🔥 ترفند مهم برای Render: اگر درخواست HTTP بود، پاسخ OK بده
-            if data.strip().startswith(('GET', 'POST', 'HTTP')):
-                client_socket.send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            # 🔥 اگر درخواست HTTP بود، پاسخ OK بده
+            if data.startswith(b'GET') or data.startswith(b'POST') or data.startswith(b'HEAD'):
+                response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
+                client_socket.send(response)
+                client_socket.close()
+                print("✅ Responded to HTTP health check")
+                return
+
+            # تبدیل داده به رشته برای پردازش JSON
+            try:
+                data_str = data.decode('utf-8')
+            except:
                 client_socket.close()
                 return
 
-            # بقیه کدهای لاگین و پردازش پیام (همان کدهای قبلی)
-            login_data = json.loads(data)
+            login_data = json.loads(data_str)
+
             if login_data.get("type") == "login":
                 username = login_data.get("username", "").strip()
                 if not username:
@@ -87,7 +98,7 @@ class GameServer:
                         print(f"⚠️ Error processing message from {username}: {e}")
                         break
         except Exception as e:
-            print(f"⚠️ Error handling client {username}: {e}")
+            print(f"⚠️ Error handling client: {e}")
         finally:
             if username:
                 with self.lock:
@@ -100,7 +111,6 @@ class GameServer:
             except:
                 pass
 
-    # توابع process_message, broadcast, broadcast_user_list, send_user_list رو همون‌طور که قبلاً بود، اینجا قرار بده
     def process_message(self, sender, message):
         msg_type = message.get("type")
         if msg_type == "chat_message":
