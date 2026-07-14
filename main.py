@@ -2,13 +2,14 @@ import asyncio
 import json
 import os
 import websockets
+from websockets.server import WebSocketServerProtocol
 
 connected_users = {}  # {username: websocket}
 
-async def handler(websocket, path):
+async def handler(websocket: WebSocketServerProtocol, path: str):
     username = None
     try:
-        # دریافت اطلاعات لاگین
+        # اولین پیام را دریافت کن
         data = await websocket.recv()
         login_data = json.loads(data)
 
@@ -89,40 +90,17 @@ async def send_user_list(username):
         except:
             pass
 
-# ===== اضافه کردن یک سرور HTTP ساده برای Health Check =====
-async def health_check_handler(reader, writer):
-    try:
-        data = await reader.read(1024)
-        if data:
-            # تشخیص درخواست HEAD یا GET
-            if data.startswith(b'HEAD') or data.startswith(b'GET'):
-                response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
-                writer.write(response)
-                await writer.drain()
-    except:
-        pass
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
 async def main():
     port = int(os.environ.get("PORT", 10000))
     print("=" * 50)
     print("🚀 VOIDVISION GAME SERVER (WebSocket + HTTP Health Check)")
     print("=" * 50)
 
-    # راه‌اندازی سرور WebSocket
-    ws_server = await websockets.serve(handler, "", port)
-
-    # راه‌اندازی یک سرور HTTP ساده برای Health Check (روی همان پورت)
-    http_server = await asyncio.start_server(health_check_handler, "", port)
-
-    print(f"✅ WebSocket server started on port {port}")
-    print(f"✅ HTTP health check server started on port {port}")
-    print("🟢 Waiting for connections...")
-
-    # اجرای هر دو سرور به صورت همزمان
-    await asyncio.gather(ws_server.wait_closed(), http_server.wait_closed())
+    # ===== یک سرور واحد که هم WebSocket و هم HTTP ساده را قبول کند =====
+    async with websockets.serve(handler, "", port, compression=None) as server:
+        print(f"✅ Server started on port {port}")
+        print("🟢 Waiting for connections...")
+        await server.wait_closed()
 
 if __name__ == "__main__":
     asyncio.run(main())
