@@ -2,11 +2,71 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 import os
 import json
+import hashlib
+import sqlite3
+import time
 
 app = FastAPI()
 
-# دیکشنری برای نگهداری کاربران آنلاین
-connected_users = {}
+# ===================== دیتابیس SQLite =====================
+def init_db():
+    """ایجاد دیتابیس و جدول کاربران"""
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at INTEGER
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def hash_password(password):
+    """هش کردن پسورد با SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def register_user(username, password):
+    """ثبت‌نام کاربر جدید"""
+    try:
+        conn = sqlite3.connect('users.db')
+        c = conn.cursor()
+        password_hash = hash_password(password)
+        c.execute('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)',
+                  (username, password_hash, int(time.time())))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False  # یوزرنیم تکراری
+
+def login_user(username, password):
+    """ورود کاربر با بررسی پسورد"""
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('SELECT password_hash FROM users WHERE username = ?', (username,))
+    result = c.fetchone()
+    conn.close()
+    if result:
+        return result[0] == hash_password(password)
+    return False
+
+def user_exists(username):
+    """بررسی وجود کاربر"""
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('SELECT 1 FROM users WHERE username = ?', (username,))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
+
+# مقداردهی اولیه دیتابیس
+init_db()
+
+# ===================== مدیریت کاربران آنلاین =====================
+connected_users = {}  # {username: websocket}
 
 @app.get("/")
 async def root():
@@ -16,63 +76,139 @@ async def root():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     username = None
-    
     try:
-        # دریافت نام کاربری
-        data = await websocket.receive_text()
-        login_data = json.loads(data)
-        
-        if login_data.get("type") == "login":
-            username = login_data.get("username", "").strip()
+        while True:
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+            msg_type = msg.get("type")
             
-            if not username:
-                await websocket.send_text(json.dumps({"type": "error", "message": "Invalid username!"}))
-                await websocket.close()
-                return
+            if msg_type == "register":
+                # ===== ثبت‌نام =====
+                username = msg.get("username", "").strip()
+                password = msg.get("password", "").strip()
                 
-            if username in connected_users:
-                await websocket.send_text(json.dumps({"type": "error", "message": "Username already taken!"}))
-                await websocket.close()
-                return
-            
-            connected_users[username] = websocket
-            await websocket.send_text(json.dumps({"type": "login_response", "status": "success"}))
-            print(f"✅ {username} connected")
-            
-            # ارسال لیست کاربران به همه
-            await broadcast_user_list()
-            
-            # حلقه دریافت پیام‌ها
-            while True:
-                try:
-                    data = await websocket.receive_text()
-                    msg = json.loads(data)
-                    msg_type = msg.get("type")
+                if not username or not password:
+                    await websocket.send_text(json.dumps({
+                        "type": "register_response",
+                        "success": False,
+                        "message": "Username and password are required!"
+                    }))
+                    continue
+                
+                if len(password) < 4:
+                    await websocket.send_text(json.dumps({
+                        "type": "register_response",
+                        "success": False,
+                        "message": "Password must be at least 4 characters!"
+                    }))
+                    continue
+                
+                if register_user(username, password):
+                    await websocket.send_text(json.dumps({
+                        "type": "register_response",
+                        "success": True,
+                        "message": "Registration successful! Please login."
+                    }))
+                else:
+                    await websocket.send_text(json.dumps({
+                        "type": "register_response",
+                        "success": False,
+                        "message": "Username already exists!"
+                    }))
                     
-                    if msg_type == "chat_message":
-                        await broadcast({
-                            "type": "chat_message",
-                            "sender": username,
-                            "message": msg.get("message", "")
-                        }, exclude=username)
-                        print(f"💬 [{username}]: {msg.get('message', '')}")
-                        
-                    elif msg_type == "game_invite":
-                        target = msg.get("target")
-                        if target and target in connected_users:
-                            await connected_users[target].send_text(json.dumps({
-                                "type": "game_invite",
-                                "sender": username,
-                                "game_name": msg.get("game_name", "Unknown Game")
-                            }))
-                            print(f"🎮 {username} invited {target}")
+            elif msg_type == "login":
+                # ===== ورود =====
+                username = msg.get("username", "").strip()
+                password = msg.get("password", "").strip()
+                
+                if not username or not password:
+                    await websocket.send_text(json.dumps({
+                        "type": "login_response",
+                        "success": False,
+                        "message": "Username and password are required!"
+                    }))
+                    continue
+                
+                if not user_exists(username):
+                    await websocket.send_text(json.dumps({
+                        "type": "login_response",
+                        "success": False,
+                        "message": "Username not found! Please register first."
+                    }))
+                    continue
+                
+                if login_user(username, password):
+                    # بررسی اینکه کاربر قبلاً آنلاین نباشه
+                    if username in connected_users:
+                        await websocket.send_text(json.dumps({
+                            "type": "login_response",
+                            "success": False,
+                            "message": "User already logged in from another device!"
+                        }))
+                        continue
+                    
+                    connected_users[username] = websocket
+                    await websocket.send_text(json.dumps({
+                        "type": "login_response",
+                        "success": True,
+                        "message": "Login successful!"
+                    }))
+                    
+                    print(f"✅ {username} connected (Total: {len(connected_users)})")
+                    await broadcast_user_list()
+                    
+                    # حلقه دریافت پیام‌ها
+                    while True:
+                        try:
+                            data = await websocket.receive_text()
+                            msg = json.loads(data)
+                            msg_type = msg.get("type")
                             
-                    elif msg_type == "get_users":
-                        await send_user_list(username)
-                        
-                except WebSocketDisconnect:
-                    break
+                            if msg_type == "chat_message":
+                                await broadcast({
+                                    "type": "chat_message",
+                                    "sender": username,
+                                    "message": msg.get("message", "")
+                                }, username)
+                                print(f"💬 [{username}]: {msg.get('message', '')}")
+                                
+                            elif msg_type == "game_invite":
+                                target = msg.get("target")
+                                if target in connected_users:
+                                    await connected_users[target].send_text(json.dumps({
+                                        "type": "game_invite",
+                                        "sender": username,
+                                        "game_name": msg.get("game_name", "Unknown Game"),
+                                        "ip": msg.get("ip", ""),
+                                        "port": msg.get("port", 0)
+                                    }))
+                                    print(f"🎮 {username} invited {target}")
+                                    
+                            elif msg_type == "get_users":
+                                await connected_users[username].send_text(json.dumps({
+                                    "type": "user_list",
+                                    "users": list(connected_users.keys())
+                                }))
+                                
+                        except WebSocketDisconnect:
+                            break
+                            
+                else:
+                    await websocket.send_text(json.dumps({
+                        "type": "login_response",
+                        "success": False,
+                        "message": "Invalid password!"
+                    }))
                     
+            elif msg_type == "logout":
+                if username:
+                    await websocket.send_text(json.dumps({
+                        "type": "logout_response",
+                        "success": True,
+                        "message": "Logged out successfully!"
+                    }))
+                break
+                
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -92,23 +228,8 @@ async def broadcast(data, exclude=None):
                 pass
 
 async def broadcast_user_list():
-    users = list(connected_users.keys())
-    await broadcast({"type": "user_list", "users": users})
-    print(f"👥 Online users: {', '.join(users) if users else 'None'}")
-
-async def send_user_list(username):
-    if username in connected_users:
-        try:
-            await connected_users[username].send_text(json.dumps({
-                "type": "user_list",
-                "users": list(connected_users.keys())
-            }))
-        except:
-            pass
+    await broadcast({"type": "user_list", "users": list(connected_users.keys())})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    print("=" * 50)
-    print("🚀 VOIDVISION SERVER (FastAPI + WebSocket)")
-    print("=" * 50)
     uvicorn.run(app, host="0.0.0.0", port=port)
