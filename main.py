@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-VoidVision Server v2.0 - Simple WebSocket Server
-برای لاگین و رجیستر و مدیریت Room
+VoidVision Server v3.0 - Stable Signaling Server
+با WebSocket Keep-Alive و مدیریت کامل Room
 """
 
 import asyncio
@@ -13,22 +13,24 @@ import uuid
 import time
 import hashlib
 import secrets
-from typing import Dict, Optional
+import logging
+from typing import Dict, Optional, Set
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-import logging
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 MAX_USERNAME_LENGTH = 32
+HEARTBEAT_INTERVAL = 15  # ثانیه
+HEARTBEAT_TIMEOUT = 10   # ثانیه
 
 # ============================================================
-# Logging
+# LOGGING
 # ============================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -37,23 +39,21 @@ logging.basicConfig(
 logger = logging.getLogger("voidvision-server")
 
 # ============================================================
-# DATABASE (در حافظه - برای تست)
+# DATABASE (در حافظه)
 # ============================================================
-users = {}  # username -> {user_id, password_hash, created_at}
-connections = {}  # user_id -> WebSocket
-user_rooms = {}  # user_id -> room_id
-rooms = {}  # room_id -> {...}
-ip_pools = {}  # subnet -> used_ips
+users: Dict[str, dict] = {}        # username -> {user_id, password_hash, ...}
+connections: Dict[str, WebSocket] = {}  # user_id -> WebSocket
+user_rooms: Dict[str, str] = {}    # user_id -> room_id
+rooms: Dict[str, dict] = {}        # room_id -> {...}
+ip_pools: Dict[str, Set[str]] = {} # subnet -> used_ips
 
 # ============================================================
 # Helper Functions
 # ============================================================
 def hash_password(password: str) -> str:
-    """هش کردن پسورد با SHA256"""
     return hashlib.sha256(password.encode()).hexdigest()
 
 def verify_password(password: str, hashed: str) -> bool:
-    """بررسی پسورد با هش"""
     return hash_password(password) == hashed
 
 def generate_room_id() -> str:
@@ -77,6 +77,8 @@ def get_next_ip(subnet: str, used_ips: set) -> Optional[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"🚀 VoidVision Server v{VERSION} starting...")
+    # شروع تسک پاک‌سازی روم‌های قدیمی
+    asyncio.create_task(cleanup_rooms_task())
     yield
     logger.info("🛑 VoidVision Server stopped")
 
@@ -98,15 +100,45 @@ app.add_middleware(
 )
 
 # ============================================================
-# WebSocket Endpoint
+# Background Tasks
+# ============================================================
+async def cleanup_rooms_task():
+    """پاک‌سازی خودکار روم‌های خالی هر ۶۰ ثانیه"""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            now = time.time()
+            to_delete = []
+            for room_id, room in rooms.items():
+                # حذف روم‌هایی که بیش از ۳۰ دقیقه غیرفعال بودن
+                if now - room.get("last_activity", now) > 1800:
+                    to_delete.append(room_id)
+                # حذف روم‌های خالی
+                elif not room.get("players", []):
+                    to_delete.append(room_id)
+            
+            for room_id in to_delete:
+                if room_id in rooms:
+                    subnet = rooms[room_id].get("subnet")
+                    if subnet and subnet in ip_pools:
+                        del ip_pools[subnet]
+                    del rooms[room_id]
+                    logger.info(f"🗑️ Room {room_id} cleaned up")
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+
+# ============================================================
+# WebSocket Endpoint (با Keep-Alive)
 # ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     user_id = None
     username = None
+    connected = True
 
     try:
+        # ====== دریافت اولین پیام (Login/Register/Auth) ======
         raw = await websocket.receive_text()
         try:
             data = json.loads(raw)
@@ -127,15 +159,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     "type": "register_response",
                     "success": False,
                     "message": "Invalid username or password (min 4 chars)"
-                }))
-                await websocket.close()
-                return
-                
-            if len(username_val) > MAX_USERNAME_LENGTH:
-                await websocket.send_text(json.dumps({
-                    "type": "register_response",
-                    "success": False,
-                    "message": f"Username too long (max {MAX_USERNAME_LENGTH})"
                 }))
                 await websocket.close()
                 return
@@ -169,15 +192,6 @@ async def websocket_endpoint(websocket: WebSocket):
             username_val = data.get("username", "").strip()
             password_val = data.get("password", "")
             
-            if not username_val or not password_val:
-                await websocket.send_text(json.dumps({
-                    "type": "login_response",
-                    "success": False,
-                    "message": "Missing credentials"
-                }))
-                await websocket.close()
-                return
-                
             user_data = users.get(username_val)
             if not user_data:
                 await websocket.send_text(json.dumps({
@@ -216,16 +230,25 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.info(f"✅ User {username} ({user_id}) logged in")
             await broadcast_user_list()
 
-            # ---------- MAIN MESSAGE LOOP ----------
-            while True:
+            # ====== MAIN MESSAGE LOOP (با Keep-Alive) ======
+            while connected:
                 try:
-                    raw = await websocket.receive_text()
+                    # دریافت پیام با timeout برای Keep-Alive
+                    raw = await asyncio.wait_for(websocket.receive_text(), timeout=HEARTBEAT_INTERVAL)
                     data = json.loads(raw)
                     await handle_message(user_id, username, data, websocket)
+                except asyncio.TimeoutError:
+                    # ارسال Ping برای بررسی زنده بودن اتصال
+                    try:
+                        await websocket.send_text(json.dumps({"type": "ping"}))
+                    except:
+                        connected = False
+                        break
+                except WebSocketDisconnect:
+                    connected = False
+                    break
                 except json.JSONDecodeError:
                     await websocket.send_text(json.dumps({"type": "error", "code": 400, "message": "Invalid JSON"}))
-                except WebSocketDisconnect:
-                    break
                 except Exception as e:
                     logger.error(f"❌ Message error: {e}")
                     await websocket.send_text(json.dumps({"type": "error", "code": 500, "message": str(e)}))
@@ -263,15 +286,23 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.close()
                 return
                 
-            while True:
+            # ====== MAIN MESSAGE LOOP (با Keep-Alive) ======
+            while connected:
                 try:
-                    raw = await websocket.receive_text()
+                    raw = await asyncio.wait_for(websocket.receive_text(), timeout=HEARTBEAT_INTERVAL)
                     data = json.loads(raw)
                     await handle_message(user_id, username, data, websocket)
+                except asyncio.TimeoutError:
+                    try:
+                        await websocket.send_text(json.dumps({"type": "ping"}))
+                    except:
+                        connected = False
+                        break
+                except WebSocketDisconnect:
+                    connected = False
+                    break
                 except json.JSONDecodeError:
                     await websocket.send_text(json.dumps({"type": "error", "code": 400, "message": "Invalid JSON"}))
-                except WebSocketDisconnect:
-                    break
                 except Exception as e:
                     logger.error(f"❌ Message error: {e}")
                     await websocket.send_text(json.dumps({"type": "error", "code": 500, "message": str(e)}))
@@ -313,7 +344,8 @@ async def cleanup_user(user_id: str, username: str):
 async def handle_message(user_id: str, username: str, data: dict, websocket: WebSocket):
     msg_type = data.get("type")
 
-    if msg_type == "ping":
+    # ====== PING (پاسخ به Keep-Alive) ======
+    if msg_type == "ping" or msg_type == "pong":
         await websocket.send_text(json.dumps({"type": "pong"}))
         return
 
@@ -346,6 +378,7 @@ async def handle_message(user_id: str, username: str, data: dict, websocket: Web
         room_name = data.get("room_name", game_name)
         password = data.get("password", "")
 
+        # هر کاربر حداکثر ۵ روم
         user_rooms_count = len([r for r in rooms.values() if user_id in r.get("players", [])])
         if user_rooms_count >= 5:
             await websocket.send_text(json.dumps({
@@ -602,9 +635,11 @@ async def leave_room(user_id: str, room_id: str):
     user_rooms.pop(user_id, None)
 
     if not room["players"]:
-        del rooms[room_id]
+        # حذف روم خالی
         subnet = room["subnet"]
-        ip_pools.pop(subnet, None)
+        if subnet in ip_pools:
+            del ip_pools[subnet]
+        del rooms[room_id]
         logger.info(f"🗑️ Room {room_id} deleted (empty)")
     else:
         if room["host"] == user_id:
@@ -725,5 +760,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         reload=False,
-        workers=1,
+        workers=1,  # برای WebSocket حتماً ۱ worker
     )
