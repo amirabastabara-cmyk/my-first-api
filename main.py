@@ -1,4 +1,4 @@
-# server.py
+# server.py - سبک و سریع برای VPS با رم کم
 import json
 import uuid
 import bcrypt
@@ -6,12 +6,11 @@ import jwt
 import os
 import time
 from datetime import datetime, timedelta
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-app = FastAPI(title="VoidVision Server")
+app = FastAPI(title="VoidVision Signaling Server (Light)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,7 +21,7 @@ app.add_middleware(
 )
 
 # ================== Config ==================
-JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
+JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-in-production")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 BCRYPT_ROUNDS = 12
@@ -36,41 +35,15 @@ class UserLogin(BaseModel):
     username: str
     password: str
 
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    username: str
-    user_id: str
-
 # ================== Database (in-memory) ==================
-users_db = {}       # username -> {"password_hash": str, "user_id": str, "created": float}
-online_users = {}   # username -> websocket
-user_tokens = {}    # username -> token
-rooms = {}          # room_id -> dict
-friend_requests = {}  # username -> [from_user]
-friends = {}        # username -> [friend_username]
-
-security = HTTPBearer()
-
-def create_token(username: str, user_id: str) -> str:
-    payload = {
-        "sub": username,
-        "user_id": user_id,
-        "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES),
-        "iat": datetime.utcnow()
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-def verify_token(token: str) -> dict:
-    try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+users_db = {}          # username -> {"password_hash": str, "user_id": str}
+online_users = {}      # username -> websocket
+rooms = {}             # room_id -> dict
+friend_requests = {}   # username -> [from_user]
+friends = {}           # username -> [friend_username]
 
 # ================== REST API ==================
-@app.post("/api/register", response_model=dict)
+@app.post("/api/register")
 async def register(user: UserRegister):
     username = user.username.strip()
     password = user.password.strip()
@@ -80,12 +53,12 @@ async def register(user: UserRegister):
         return {"success": False, "message": "Username already exists"}
     password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(BCRYPT_ROUNDS)).decode()
     user_id = str(uuid.uuid4())
-    users_db[username] = {"password_hash": password_hash, "user_id": user_id, "created": time.time()}
+    users_db[username] = {"password_hash": password_hash, "user_id": user_id}
     friends[username] = []
     friend_requests[username] = []
     return {"success": True, "message": "Registered successfully"}
 
-@app.post("/api/login", response_model=TokenResponse)
+@app.post("/api/login")
 async def login(user: UserLogin):
     username = user.username.strip()
     password = user.password.strip()
@@ -94,17 +67,15 @@ async def login(user: UserLogin):
     stored = users_db[username]
     if not bcrypt.checkpw(password.encode(), stored["password_hash"].encode()):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_token(username, stored["user_id"])
-    user_tokens[username] = token
-    return TokenResponse(access_token=token, username=username, user_id=stored["user_id"])
+    payload = {
+        "sub": username,
+        "user_id": stored["user_id"],
+        "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return {"access_token": token, "token_type": "bearer", "username": username, "user_id": stored["user_id"]}
 
-@app.get("/api/verify")
-async def verify(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    payload = verify_token(token)
-    return {"valid": True, "username": payload["sub"], "user_id": payload["user_id"]}
-
-# ================== WebSocket ==================
+# ================== WebSocket (Signaling) ==================
 class ConnectionManager:
     def __init__(self):
         self.active_connections = []
@@ -149,19 +120,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 msg = json.loads(raw)
                 t = msg.get("type")
 
-                # ========== AUTH ==========
+                # ---------- AUTH ----------
                 if t == "auth":
                     token = msg.get("token")
                     if not token:
                         await websocket.send_json({"type": "auth_response", "success": False, "message": "No token"})
                         continue
                     try:
-                        payload = verify_token(token)
+                        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
                         username = payload["sub"]
                         user_id = payload["user_id"]
                         if username not in users_db or users_db[username]["user_id"] != user_id:
                             raise Exception("Invalid user")
-                        # اگر قبلاً آنلاین بود، قطعش کن
                         if username in online_users:
                             old = online_users[username]
                             if old != websocket:
@@ -174,9 +144,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             "username": username,
                             "user_id": user_id
                         })
-                        # ارسال لیست کاربران آنلاین و دوستان
+                        # ارسال لیست کاربران آنلاین
                         await manager.broadcast({"type": "user_list", "users": list(online_users.keys())})
-                        # ارسال درخواست‌های دوستی
+                        # ارسال دوستان و درخواست‌ها
                         await websocket.send_json({
                             "type": "friend_requests_list",
                             "requests": friend_requests.get(username, [])
@@ -189,12 +159,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_json({"type": "auth_response", "success": False, "message": str(e)})
                     continue
 
-                # ========== اگر احراز نشده ==========
                 if not current_user:
                     await websocket.send_json({"type": "error", "message": "Not authenticated"})
                     continue
 
-                # ========== ROOM LIST ==========
+                # ---------- ROOM LIST ----------
                 if t == "get_room_list":
                     room_list = []
                     for rid, r in rooms.items():
@@ -207,7 +176,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
                     await websocket.send_json({"type": "room_list", "rooms": room_list})
 
-                # ========== CREATE ROOM ==========
+                # ---------- CREATE ROOM ----------
                 elif t == "create_room":
                     room_id = str(uuid.uuid4())[:6]
                     rooms[room_id] = {
@@ -216,7 +185,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "max_players": msg.get("max_players", 8),
                         "host": current_user,
                         "players": [current_user],
-                        "room_key": str(uuid.uuid4())  # برای رمزگذاری
+                        "room_key": str(uuid.uuid4())
                     }
                     await websocket.send_json({
                         "type": "room_created",
@@ -227,10 +196,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             "subnet": "10.77.0."
                         }
                     })
-                    # بروزرسانی لیست روم‌ها برای همه
+                    # ارسال لیست جدید روم‌ها به همه
                     await manager.broadcast({"type": "room_list", "rooms": []})  # ساده‌سازی
 
-                # ========== JOIN ROOM ==========
+                # ---------- JOIN ROOM ----------
                 elif t == "join_room":
                     room_id = msg.get("room_id")
                     pwd = msg.get("password", "")
@@ -266,7 +235,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "room_key": room["room_key"]
                     })
 
-                # ========== LEAVE ROOM ==========
+                # ---------- LEAVE ROOM ----------
                 elif t == "leave_room":
                     for rid, room in list(rooms.items()):
                         if current_user in room["players"]:
@@ -287,17 +256,19 @@ async def websocket_endpoint(websocket: WebSocket):
                             break
                     await websocket.send_json({"type": "left_room", "success": True})
 
-                # ========== OFFER / ANSWER / ICE ==========
+                # ---------- OFFER / ANSWER / ICE (Signaling) ----------
                 elif t == "offer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
                     game = msg.get("game_name", "")
+                    salt = msg.get("salt", "")  # برای Crypto
                     if target and sdp:
                         await manager.send_to_user(target, {
                             "type": "offer_received",
                             "from": current_user,
                             "sdp": sdp,
-                            "game_name": game
+                            "game_name": game,
+                            "salt": salt
                         })
 
                 elif t == "answer":
@@ -320,7 +291,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "candidate": cand
                         })
 
-                # ========== CHAT ==========
+                # ---------- CHAT ----------
                 elif t == "chat_message":
                     text = msg.get("message", "")[:500]
                     if current_user and text:
@@ -330,7 +301,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "message": text
                         })
 
-                # ========== FRIENDS ==========
+                # ---------- FRIENDS ----------
                 elif t == "friend_request":
                     target = msg.get("target")
                     if target and target in users_db:
@@ -340,18 +311,12 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "type": "friend_request_received",
                                 "from": current_user
                             })
-                            await websocket.send_json({
-                                "type": "friend_request_sent",
-                                "to": target
-                            })
 
                 elif t == "friend_accept":
                     target = msg.get("target")
                     if target:
-                        # حذف از درخواست‌ها
                         if target in friend_requests.get(current_user, []):
                             friend_requests[current_user].remove(target)
-                        # اضافه کردن به دوستان
                         if current_user not in friends.get(target, []):
                             friends.setdefault(target, []).append(current_user)
                         if target not in friends.get(current_user, []):
@@ -364,7 +329,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             "type": "friends_list",
                             "friends": friends.get(current_user, [])
                         })
-                        # بروزرسانی لیست دوستان برای طرف مقابل
                         await manager.send_to_user(target, {
                             "type": "friends_list",
                             "friends": friends.get(target, [])
@@ -374,20 +338,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     target = msg.get("target")
                     if target and target in friend_requests.get(current_user, []):
                         friend_requests[current_user].remove(target)
-                        await websocket.send_json({
-                            "type": "friend_request_rejected",
-                            "from": current_user
-                        })
 
-                elif t == "get_friend_requests":
-                    await websocket.send_json({
-                        "type": "friend_requests_list",
-                        "requests": friend_requests.get(current_user, [])
-                    })
-
-                # ========== GAME LAUNCH SYNC ==========
+                # ---------- READY & LAUNCH ----------
                 elif t == "ready_to_launch":
-                    # کاربر اعلام آمادگی برای اجرای بازی
                     await manager.broadcast({
                         "type": "player_ready",
                         "player": current_user,
@@ -395,7 +348,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
 
                 elif t == "launch_game":
-                    # هاست دستور اجرای بازی می‌دهد
                     game = msg.get("game_name")
                     room_id = msg.get("room_id")
                     room = rooms.get(room_id)
