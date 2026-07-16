@@ -136,7 +136,7 @@ async def websocket_endpoint(websocket: WebSocket):
             user_id = str(uuid.uuid4())
             app.state.users[username_val] = {
                 "user_id": user_id,
-                "password": password_val,  # In production: hash this!
+                "password": password_val,
                 "created_at": time.time()
             }
             await websocket.send_text(json.dumps({
