@@ -1,3 +1,10 @@
-fastapi==0.110.0
-uvicorn==0.27.1
-websockets==12.0
+fastapi
+uvicorn
+websockets
+PyQt5
+requests
+websocket-client
+aiortc
+cryptography
+bcrypt
+pyjwt
