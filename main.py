@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-VoidVision Server v3.0 - Stable Signaling Server
+VoidVision Server v4.0 - Stable Signaling Server
 با WebSocket Keep-Alive و مدیریت کامل Room
 """
 
@@ -24,10 +24,9 @@ import uvicorn
 # ============================================================
 # CONFIGURATION
 # ============================================================
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 MAX_USERNAME_LENGTH = 32
 HEARTBEAT_INTERVAL = 15  # ثانیه
-HEARTBEAT_TIMEOUT = 10   # ثانیه
 
 # ============================================================
 # LOGGING
@@ -41,11 +40,11 @@ logger = logging.getLogger("voidvision-server")
 # ============================================================
 # DATABASE (در حافظه)
 # ============================================================
-users: Dict[str, dict] = {}        # username -> {user_id, password_hash, ...}
-connections: Dict[str, WebSocket] = {}  # user_id -> WebSocket
-user_rooms: Dict[str, str] = {}    # user_id -> room_id
-rooms: Dict[str, dict] = {}        # room_id -> {...}
-ip_pools: Dict[str, Set[str]] = {} # subnet -> used_ips
+users: Dict[str, dict] = {}
+connections: Dict[str, WebSocket] = {}
+user_rooms: Dict[str, str] = {}
+rooms: Dict[str, dict] = {}
+ip_pools: Dict[str, Set[str]] = {}
 
 # ============================================================
 # Helper Functions
@@ -77,7 +76,6 @@ def get_next_ip(subnet: str, used_ips: set) -> Optional[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"🚀 VoidVision Server v{VERSION} starting...")
-    # شروع تسک پاک‌سازی روم‌های قدیمی
     asyncio.create_task(cleanup_rooms_task())
     yield
     logger.info("🛑 VoidVision Server stopped")
@@ -88,9 +86,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# ============================================================
-# CORS
-# ============================================================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -103,20 +98,16 @@ app.add_middleware(
 # Background Tasks
 # ============================================================
 async def cleanup_rooms_task():
-    """پاک‌سازی خودکار روم‌های خالی هر ۶۰ ثانیه"""
     while True:
         await asyncio.sleep(60)
         try:
             now = time.time()
             to_delete = []
             for room_id, room in rooms.items():
-                # حذف روم‌هایی که بیش از ۳۰ دقیقه غیرفعال بودن
                 if now - room.get("last_activity", now) > 1800:
                     to_delete.append(room_id)
-                # حذف روم‌های خالی
                 elif not room.get("players", []):
                     to_delete.append(room_id)
-            
             for room_id in to_delete:
                 if room_id in rooms:
                     subnet = rooms[room_id].get("subnet")
@@ -138,7 +129,6 @@ async def websocket_endpoint(websocket: WebSocket):
     connected = True
 
     try:
-        # ====== دریافت اولین پیام (Login/Register/Auth) ======
         raw = await websocket.receive_text()
         try:
             data = json.loads(raw)
@@ -233,12 +223,10 @@ async def websocket_endpoint(websocket: WebSocket):
             # ====== MAIN MESSAGE LOOP (با Keep-Alive) ======
             while connected:
                 try:
-                    # دریافت پیام با timeout برای Keep-Alive
                     raw = await asyncio.wait_for(websocket.receive_text(), timeout=HEARTBEAT_INTERVAL)
                     data = json.loads(raw)
                     await handle_message(user_id, username, data, websocket)
                 except asyncio.TimeoutError:
-                    # ارسال Ping برای بررسی زنده بودن اتصال
                     try:
                         await websocket.send_text(json.dumps({"type": "ping"}))
                     except:
@@ -286,7 +274,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.close()
                 return
                 
-            # ====== MAIN MESSAGE LOOP (با Keep-Alive) ======
             while connected:
                 try:
                     raw = await asyncio.wait_for(websocket.receive_text(), timeout=HEARTBEAT_INTERVAL)
@@ -306,7 +293,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"❌ Message error: {e}")
                     await websocket.send_text(json.dumps({"type": "error", "code": 500, "message": str(e)}))
-                    
+
             await cleanup_user(user_id, username)
             return
 
@@ -344,7 +331,6 @@ async def cleanup_user(user_id: str, username: str):
 async def handle_message(user_id: str, username: str, data: dict, websocket: WebSocket):
     msg_type = data.get("type")
 
-    # ====== PING (پاسخ به Keep-Alive) ======
     if msg_type == "ping" or msg_type == "pong":
         await websocket.send_text(json.dumps({"type": "pong"}))
         return
@@ -378,7 +364,6 @@ async def handle_message(user_id: str, username: str, data: dict, websocket: Web
         room_name = data.get("room_name", game_name)
         password = data.get("password", "")
 
-        # هر کاربر حداکثر ۵ روم
         user_rooms_count = len([r for r in rooms.values() if user_id in r.get("players", [])])
         if user_rooms_count >= 5:
             await websocket.send_text(json.dumps({
@@ -635,7 +620,6 @@ async def leave_room(user_id: str, room_id: str):
     user_rooms.pop(user_id, None)
 
     if not room["players"]:
-        # حذف روم خالی
         subnet = room["subnet"]
         if subnet in ip_pools:
             del ip_pools[subnet]
@@ -760,5 +744,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         reload=False,
-        workers=1,  # برای WebSocket حتماً ۱ worker
+        workers=1,
     )
