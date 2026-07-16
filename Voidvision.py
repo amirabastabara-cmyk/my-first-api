@@ -1328,4 +1328,4 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_())                                                            خب این اوکیه ؟ یا هنوز مشکل داره ؟
+    sys.exit(app.exec_()) 
