@@ -1,13 +1,14 @@
-# main.py - سرور WebSocket با FastAPI برای VoidVision
+# server.py
 import json
 import uuid
-import asyncio
+import hashlib
+import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="VoidVision Server")
+app = FastAPI(title="VoidVision Signaling Server")
 
-# CORS برای اتصال از هر کلاینت
+# CORS برای دسترسی از هر کلاینتی
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,122 +17,123 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ذخیره‌سازی موقت در حافظه
-users = {}          # username -> password
-online = set()      # active usernames
-rooms = {}          # room_id -> dict
-user_ws = {}        # username -> WebSocket (برای ارسال پیام مستقیم)
-pending_offers = {} # target_username -> list of pending offers
+# دیتابیس موقت در حافظه (برای تست)
+users_db = {}          # username -> password
+online_users = set()   # username
+rooms = {}             # room_id -> dict
+user_connections = {}  # username -> WebSocket
 
-class ConnectionManager:
+DEFAULT_SUBNET = "10.77.0."
+
+class Manager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
-        self.connection_username: Dict[WebSocket, str] = {}
+        self.active_connections = []
+        self.user_map = {}
 
     async def connect(self, websocket: WebSocket, username: str):
         await websocket.accept()
         self.active_connections.append(websocket)
-        self.connection_username[websocket] = username
-        online.add(username)
-        user_ws[username] = websocket
+        self.user_map[websocket] = username
+        online_users.add(username)
+        user_connections[username] = websocket
 
     def disconnect(self, websocket: WebSocket):
-        username = self.connection_username.pop(websocket, None)
+        username = self.user_map.pop(websocket, None)
         if username:
-            online.discard(username)
-            user_ws.pop(username, None)
+            online_users.discard(username)
+            user_connections.pop(username, None)
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
 
-    async def send_personal(self, username: str, message: dict):
-        ws = user_ws.get(username)
+    async def send_to_user(self, username: str, data: dict):
+        ws = user_connections.get(username)
         if ws:
-            await ws.send_json(message)
+            await ws.send_json(data)
 
-    async def broadcast(self, message: dict, exclude=None):
+    async def broadcast(self, data: dict, exclude=None):
         for conn in self.active_connections:
             if conn != exclude:
-                await conn.send_json(message)
+                try:
+                    await conn.send_json(data)
+                except:
+                    pass
 
-manager = ConnectionManager()
+manager = Manager()
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
     current_user = None
     try:
         while True:
             raw = await websocket.receive_text()
             try:
                 msg = json.loads(raw)
-                msg_type = msg.get("type")
+                t = msg.get("type")
 
                 # ---------- REGISTER ----------
-                if msg_type == "register":
-                    username = msg.get("username", "").strip()
-                    password = msg.get("password", "").strip()
-                    if not username or len(password) < 4:
-                        await websocket.send_json({"type": "register_response", "success": False, "message": "Invalid credentials"})
-                        continue
-                    if username in users:
-                        await websocket.send_json({"type": "register_response", "success": False, "message": "Username already exists"})
+                if t == "register":
+                    u = msg.get("username", "").strip()
+                    p = msg.get("password", "").strip()
+                    if not u or len(p) < 4:
+                        await websocket.send_json({"type": "register_response", "success": False, "message": "Invalid"})
+                    elif u in users_db:
+                        await websocket.send_json({"type": "register_response", "success": False, "message": "Exists"})
                     else:
-                        users[username] = password
-                        await websocket.send_json({"type": "register_response", "success": True, "message": "Registered successfully"})
+                        users_db[u] = p
+                        await websocket.send_json({"type": "register_response", "success": True, "message": "OK"})
 
                 # ---------- LOGIN ----------
-                elif msg_type == "login":
-                    username = msg.get("username", "").strip()
-                    password = msg.get("password", "").strip()
-                    if username in users and users[username] == password:
-                        # logout previous session if any
-                        if username in online:
-                            old_ws = user_ws.get(username)
-                            if old_ws and old_ws != websocket:
-                                await old_ws.close(code=1000, reason="Duplicate login")
-                        await manager.connect(websocket, username)
-                        current_user = username
+                elif t == "login":
+                    u = msg.get("username", "").strip()
+                    p = msg.get("password", "").strip()
+                    if u in users_db and users_db[u] == p:
+                        # قطع جلسه قبلی اگر باشد
+                        if u in online_users:
+                            old = user_connections.get(u)
+                            if old and old != websocket:
+                                await old.close(code=1000, reason="Duplicate login")
+                        await manager.connect(websocket, u)
+                        current_user = u
                         await websocket.send_json({
                             "type": "login_response",
                             "success": True,
-                            "username": username,
+                            "username": u,
                             "user_id": str(uuid.uuid4())
                         })
-                        # Send updated user list to all
-                        await manager.broadcast({"type": "user_list", "users": list(online)})
+                        await manager.broadcast({"type": "user_list", "users": list(online_users)})
                     else:
-                        await websocket.send_json({"type": "login_response", "success": False, "message": "Invalid username/password"})
+                        await websocket.send_json({"type": "login_response", "success": False, "message": "Wrong"})
 
                 # ---------- GET USER LIST ----------
-                elif msg_type == "get_user_list":
-                    await websocket.send_json({"type": "user_list", "users": list(online)})
+                elif t == "get_user_list":
+                    await websocket.send_json({"type": "user_list", "users": list(online_users)})
 
-                # ---------- GET ROOM LIST ----------
-                elif msg_type == "get_room_list":
+                # ---------- ROOM LIST ----------
+                elif t == "get_room_list":
                     room_list = []
-                    for rid, rdata in rooms.items():
+                    for rid, r in rooms.items():
                         room_list.append({
                             "room_id": rid,
-                            "room_name": rdata["name"],
-                            "has_password": bool(rdata.get("password")),
-                            "count": len(rdata["players"]),
-                            "max": rdata["max_players"]
+                            "room_name": r["name"],
+                            "has_password": bool(r.get("password")),
+                            "count": len(r["players"]),
+                            "max": r["max_players"]
                         })
                     await websocket.send_json({"type": "room_list", "rooms": room_list})
 
                 # ---------- CREATE ROOM ----------
-                elif msg_type == "create_room":
+                elif t == "create_room":
                     if not current_user:
                         await websocket.send_json({"type": "error", "message": "Not logged in"})
                         continue
                     room_id = str(uuid.uuid4())[:6]
                     rooms[room_id] = {
-                        "name": msg.get("room_name", "New Room"),
+                        "name": msg.get("room_name", "Room"),
                         "password": msg.get("password", ""),
                         "max_players": msg.get("max_players", 8),
                         "host": current_user,
                         "players": [current_user],
-                        "room_key": hashlib.sha256(os.urandom(32)).hexdigest()  # for P2P encryption
+                        "room_key": hashlib.sha256(os.urandom(32)).hexdigest()
                     }
                     await websocket.send_json({
                         "type": "room_created",
@@ -139,32 +141,31 @@ async def websocket_endpoint(websocket: WebSocket):
                             "room_id": room_id,
                             "room_name": rooms[room_id]["name"],
                             "room_key": rooms[room_id]["room_key"],
-                            "subnet": DEFAULT_SUBNET  # از تنظیمات سرور
+                            "subnet": DEFAULT_SUBNET
                         }
                     })
-                    # ارسال لیست روم‌ها به همه
-                    await manager.broadcast({"type": "room_list", "rooms": [...]})  # به‌روزرسانی ساده
+                    # به‌روزرسانی لیست روم‌ها برای همه
+                    await manager.broadcast({"type": "room_list", "rooms": room_list})  # بازسازی لیست
 
                 # ---------- JOIN ROOM ----------
-                elif msg_type == "join_room":
+                elif t == "join_room":
                     if not current_user:
                         await websocket.send_json({"type": "error", "message": "Not logged in"})
                         continue
                     room_id = msg.get("room_id")
-                    password = msg.get("password", "")
+                    pwd = msg.get("password", "")
                     if room_id not in rooms:
-                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Room not found"})
+                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Not found"})
                         continue
                     room = rooms[room_id]
-                    if room.get("password") and room["password"] != password:
+                    if room.get("password") and room["password"] != pwd:
                         await websocket.send_json({"type": "room_joined", "success": False, "message": "Wrong password"})
                         continue
                     if len(room["players"]) >= room["max_players"]:
-                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Room full"})
+                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Full"})
                         continue
                     if current_user not in room["players"]:
                         room["players"].append(current_user)
-                    # پاسخ به کاربر
                     await websocket.send_json({
                         "type": "room_joined",
                         "room": {
@@ -174,75 +175,76 @@ async def websocket_endpoint(websocket: WebSocket):
                             "subnet": DEFAULT_SUBNET
                         }
                     })
-                    # ارسال لیست بازیکنان به همه اعضای روم (شامل هاست)
-                    player_list = room["players"]
-                    host = room["host"]
-                    # تخصیص IP مجازی
-                    ips = {}
-                    for idx, p in enumerate(player_list, start=1):
-                        ips[p] = f"{DEFAULT_SUBNET}{idx}"
+                    # ارسال لیست بازیکنان به همه اعضای روم
+                    ips = {p: f"{DEFAULT_SUBNET}{i+1}" for i, p in enumerate(room["players"])}
                     await manager.broadcast({
                         "type": "room_players",
-                        "players": player_list,
+                        "players": room["players"],
                         "ips": ips,
-                        "host": host,
+                        "host": room["host"],
                         "subnet": DEFAULT_SUBNET,
                         "room_key": room["room_key"]
-                    }, exclude=None)  # به همه بفرست
+                    })
 
                 # ---------- LEAVE ROOM ----------
-                elif msg_type == "leave_room":
+                elif t == "leave_room":
                     if current_user:
-                        for rid, room in rooms.items():
+                        for rid, room in list(rooms.items()):
                             if current_user in room["players"]:
                                 room["players"].remove(current_user)
-                                # اگر هاست رفت، روم حذف شود
                                 if room["host"] == current_user or not room["players"]:
                                     del rooms[rid]
                                     await manager.broadcast({"type": "room_closed", "room_id": rid})
                                 else:
-                                    await manager.broadcast({"type": "room_players", ...})  # به‌روزرسانی
+                                    ips = {p: f"{DEFAULT_SUBNET}{i+1}" for i, p in enumerate(room["players"])}
+                                    await manager.broadcast({
+                                        "type": "room_players",
+                                        "players": room["players"],
+                                        "ips": ips,
+                                        "host": room["host"],
+                                        "subnet": DEFAULT_SUBNET,
+                                        "room_key": room["room_key"]
+                                    })
                                 break
                         await websocket.send_json({"type": "left_room", "success": True})
 
-                # ---------- OFFER (WebRTC Signaling) ----------
-                elif msg_type == "offer":
+                # ---------- OFFER (WebRTC signaling) ----------
+                elif t == "offer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
-                    game_name = msg.get("game_name", "")
+                    game = msg.get("game_name", "")
                     if target and sdp:
-                        # ارسال به target
-                        await manager.send_personal(target, {
+                        await manager.send_to_user(target, {
                             "type": "offer_received",
                             "from": current_user,
                             "sdp": sdp,
-                            "game_name": game_name
+                            "game_name": game
                         })
 
                 # ---------- ANSWER ----------
-                elif msg_type == "answer":
+                elif t == "answer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
                     if target and sdp:
-                        await manager.send_personal(target, {
+                        await manager.send_to_user(target, {
                             "type": "answer_received",
                             "from": current_user,
                             "sdp": sdp
                         })
 
                 # ---------- ICE CANDIDATE ----------
-                elif msg_type == "ice_candidate":
+                elif t == "ice_candidate":
                     target = msg.get("target")
-                    candidate = msg.get("candidate")
-                    if target and candidate:
-                        await manager.send_personal(target, {
+                    cand = msg.get("candidate")
+                    if target and cand:
+                        await manager.send_to_user(target, {
                             "type": "ice_candidate_received",
                             "from": current_user,
-                            "candidate": candidate
+                            "candidate": cand
                         })
 
-                # ---------- CHAT MESSAGE ----------
-                elif msg_type == "chat_message":
+                # ---------- CHAT ----------
+                elif t == "chat_message":
                     text = msg.get("message", "")[:500]
                     if current_user and text:
                         await manager.broadcast({
@@ -251,46 +253,43 @@ async def websocket_endpoint(websocket: WebSocket):
                             "message": text
                         })
 
-                # ---------- FRIEND REQUEST (ساده) ----------
-                elif msg_type == "friend_request":
+                # ---------- FRIEND ----------
+                elif t == "friend_request":
                     target = msg.get("target")
-                    if target and target in online:
-                        await manager.send_personal(target, {
+                    if target:
+                        await manager.send_to_user(target, {
                             "type": "friend_request",
                             "from": current_user,
                             "message": msg.get("message", "")
                         })
-                elif msg_type == "friend_accept":
+                elif t == "friend_accept":
                     target = msg.get("target")
-                    if target and target in online:
-                        await manager.send_personal(target, {
+                    if target:
+                        await manager.send_to_user(target, {
                             "type": "friend_accepted",
                             "from": current_user
                         })
-                elif msg_type == "friend_reject":
+                elif t == "friend_reject":
                     target = msg.get("target")
-                    if target and target in online:
-                        await manager.send_personal(target, {
+                    if target:
+                        await manager.send_to_user(target, {
                             "type": "friend_rejected",
                             "from": current_user
                         })
 
-                # ---------- GAME INVITE ----------
-                elif msg_type == "game_invite":
+                # ---------- INVITE ----------
+                elif t == "game_invite":
                     target = msg.get("target")
-                    game_name = msg.get("game_name", "")
-                    room_id = msg.get("room_id", "")
-                    if target and target in online:
-                        await manager.send_personal(target, {
+                    if target:
+                        await manager.send_to_user(target, {
                             "type": "game_invite",
                             "from": current_user,
-                            "game_name": game_name,
-                            "room_id": room_id
+                            "game_name": msg.get("game_name", ""),
+                            "room_id": msg.get("room_id", "")
                         })
 
-                # ---------- UNKNOWN ----------
                 else:
-                    await websocket.send_json({"type": "error", "message": f"Unknown type: {msg_type}"})
+                    await websocket.send_json({"type": "error", "message": f"Unknown type: {t}"})
 
             except json.JSONDecodeError:
                 await websocket.send_json({"type": "error", "message": "Invalid JSON"})
@@ -298,14 +297,8 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
         if current_user:
-            # به‌روزرسانی لیست کاربران
-            await manager.broadcast({"type": "user_list", "users": list(online)})
-        print(f"User {current_user or 'Unknown'} disconnected")
+            await manager.broadcast({"type": "user_list", "users": list(online_users)})
 
 if __name__ == "__main__":
     import uvicorn
-    import os
-    # برای تولید کلید روم از hashlib نیازمندیم
-    import hashlib
-    DEFAULT_SUBNET = "10.77.0."
     uvicorn.run(app, host="0.0.0.0", port=8000)
