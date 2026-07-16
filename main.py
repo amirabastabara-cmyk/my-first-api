@@ -3,7 +3,7 @@
 
 """
 VoidVision Server v1.0 - FastAPI + WebSocket Signaling
-Run this on your VPS or Render
+Run this on Render / VPS
 """
 
 import asyncio
@@ -602,7 +602,7 @@ async def health():
 # Run
 # ============================================================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
