@@ -1,312 +1,612 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import uvicorn
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+VoidVision Server v1.0 - FastAPI + WebSocket Signaling
+Run this on your VPS
+"""
+
+import asyncio
 import json
-import hashlib
-import sqlite3
+import os
+import uuid
 import time
+import secrets
+from typing import Dict, List, Optional, Set
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+import logging
 
-# ===================== دیتابیس =====================
-def init_db():
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    # جدول کاربران
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at INTEGER
-        )
-    ''')
-    # جدول دوستان
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS friends (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            friend_id INTEGER NOT NULL,
-            status TEXT DEFAULT 'pending',  -- pending, accepted, rejected
-            created_at INTEGER,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (friend_id) REFERENCES users(id),
-            UNIQUE(user_id, friend_id)
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# ============================================================
+# CONFIGURATION
+# ============================================================
+VERSION = "1.0.0"
+MAX_ROOMS_PER_USER = 5
+MAX_PLAYERS_PER_ROOM = 16
+MAX_USERNAME_LENGTH = 32
 
-def get_user_id(username):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('SELECT id FROM users WHERE username = ?', (username,))
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else None
+# ============================================================
+# Logging
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("voidvision-server")
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+# ============================================================
+# FastAPI App
+# ============================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"🚀 VoidVision Server v{VERSION} starting...")
+    app.state.rooms: Dict[str, dict] = {}
+    app.state.users: Dict[str, dict] = {}
+    app.state.connections: Dict[str, WebSocket] = {}
+    app.state.user_rooms: Dict[str, str] = {}
+    app.state.ip_pools: Dict[str, Set[str]] = {}
+    yield
+    logger.info("🛑 VoidVision Server stopped")
 
-def register_user(username, password):
-    try:
-        conn = sqlite3.connect('users.db')
-        c = conn.cursor()
-        password_hash = hash_password(password)
-        c.execute('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)',
-                  (username, password_hash, int(time.time())))
-        conn.commit()
-        conn.close()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+app = FastAPI(
+    title="VoidVision Server",
+    version=VERSION,
+    lifespan=lifespan
+)
 
-def login_user(username, password):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('SELECT password_hash FROM users WHERE username = ?', (username,))
-    result = c.fetchone()
-    conn.close()
-    if result:
-        return result[0] == hash_password(password)
-    return False
+# ============================================================
+# CORS
+# ============================================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def add_friend_request(user_id, friend_username):
-    friend_id = get_user_id(friend_username)
-    if not friend_id or user_id == friend_id:
-        return False
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    try:
-        c.execute('INSERT INTO friends (user_id, friend_id, status, created_at) VALUES (?, ?, ?, ?)',
-                  (user_id, friend_id, 'pending', int(time.time())))
-        conn.commit()
-        conn.close()
-        return True
-    except sqlite3.IntegrityError:
-        conn.close()
-        return False
+# ============================================================
+# Helper Functions
+# ============================================================
+def generate_room_id() -> str:
+    return secrets.token_hex(4).upper()
 
-def accept_friend_request(user_id, friend_id):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('UPDATE friends SET status = "accepted" WHERE user_id = ? AND friend_id = ? AND status = "pending"',
-              (friend_id, user_id))
-    c.execute('INSERT OR IGNORE INTO friends (user_id, friend_id, status, created_at) VALUES (?, ?, ?, ?)',
-              (user_id, friend_id, 'accepted', int(time.time())))
-    conn.commit()
-    conn.close()
-    return True
+def generate_subnet() -> str:
+    x = secrets.randbelow(254) + 1
+    return f"10.77.{x}."
 
-def get_friends(user_id):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''
-        SELECT u.username, f.status 
-        FROM friends f
-        JOIN users u ON u.id = f.friend_id
-        WHERE f.user_id = ? AND f.status = 'accepted'
-    ''', (user_id,))
-    friends = c.fetchall()
-    conn.close()
-    return friends
+def get_next_ip(subnet: str, used_ips: Set[str]) -> Optional[str]:
+    for i in range(2, 255):
+        ip = f"{subnet}{i}"
+        if ip not in used_ips:
+            return ip
+    return None
 
-def get_friend_requests(user_id):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''
-        SELECT u.id, u.username
-        FROM friends f
-        JOIN users u ON u.id = f.user_id
-        WHERE f.friend_id = ? AND f.status = 'pending'
-    ''', (user_id,))
-    requests = c.fetchall()
-    conn.close()
-    return requests
-
-init_db()
-
-# ===================== مدیریت کاربران آنلاین =====================
-connected_users = {}  # {username: websocket}
-user_sessions = {}    # {username: user_id}
-
-@app.get("/")
-async def root():
-    return {"message": "VoidVision Server is running!"}
-
+# ============================================================
+# WebSocket Endpoint
+# ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    username = None
     user_id = None
+    username = None
+
     try:
-        while True:
-            data = await websocket.receive_text()
-            msg = json.loads(data)
-            msg_type = msg.get("type")
-            
-            if msg_type == "register":
-                username = msg.get("username", "").strip()
-                password = msg.get("password", "").strip()
-                if not username or not password:
-                    await websocket.send_text(json.dumps({"type": "register_response", "success": False, "message": "Username and password are required!"}))
-                    continue
-                if len(password) < 4:
-                    await websocket.send_text(json.dumps({"type": "register_response", "success": False, "message": "Password must be at least 4 characters!"}))
-                    continue
-                if register_user(username, password):
-                    await websocket.send_text(json.dumps({"type": "register_response", "success": True, "message": "Registration successful! Please login."}))
-                else:
-                    await websocket.send_text(json.dumps({"type": "register_response", "success": False, "message": "Username already exists!"}))
-                    
-            elif msg_type == "login":
-                username = msg.get("username", "").strip()
-                password = msg.get("password", "").strip()
-                if not username or not password:
-                    await websocket.send_text(json.dumps({"type": "login_response", "success": False, "message": "Username and password are required!"}))
-                    continue
-                if not login_user(username, password):
-                    await websocket.send_text(json.dumps({"type": "login_response", "success": False, "message": "Invalid credentials!"}))
-                    continue
-                if username in connected_users:
-                    await websocket.send_text(json.dumps({"type": "login_response", "success": False, "message": "User already logged in!"}))
-                    continue
-                
-                user_id = get_user_id(username)
-                connected_users[username] = websocket
-                user_sessions[username] = user_id
-                await websocket.send_text(json.dumps({"type": "login_response", "success": True, "message": "Login successful!"}))
-                await broadcast_user_list()
-                await send_friend_list(username)
-                await send_friend_requests(username)
-                
-                # حلقه اصلی
-                while True:
-                    try:
-                        data = await websocket.receive_text()
-                        msg = json.loads(data)
-                        msg_type = msg.get("type")
-                        
-                        if msg_type == "chat_message":
-                            await broadcast({
-                                "type": "chat_message",
-                                "sender": username,
-                                "message": msg.get("message", "")
-                            }, username)
-                            
-                        elif msg_type == "game_invite":
-                            target = msg.get("target")
-                            if target in connected_users:
-                                await connected_users[target].send_text(json.dumps({
-                                    "type": "game_invite",
-                                    "sender": username,
-                                    "game_name": msg.get("game_name", "Unknown Game"),
-                                    "ip": msg.get("ip", ""),
-                                    "port": msg.get("port", 0)
-                                }))
-                                
-                        elif msg_type == "get_users":
-                            await connected_users[username].send_text(json.dumps({"type": "user_list", "users": list(connected_users.keys())}))
-                            
-                        # ===== بخش دوست‌یابی =====
-                        elif msg_type == "add_friend":
-                            friend_username = msg.get("friend_username", "").strip()
-                            if not friend_username:
-                                await websocket.send_text(json.dumps({"type": "add_friend_response", "success": False, "message": "Invalid username!"}))
-                                continue
-                            if friend_username == username:
-                                await websocket.send_text(json.dumps({"type": "add_friend_response", "success": False, "message": "You cannot add yourself!"}))
-                                continue
-                            if not get_user_id(friend_username):
-                                await websocket.send_text(json.dumps({"type": "add_friend_response", "success": False, "message": "User not found!"}))
-                                continue
-                            if add_friend_request(user_id, friend_username):
-                                await websocket.send_text(json.dumps({"type": "add_friend_response", "success": True, "message": f"Friend request sent to {friend_username}!"}))
-                                # اطلاع به طرف مقابل
-                                if friend_username in connected_users:
-                                    await connected_users[friend_username].send_text(json.dumps({
-                                        "type": "friend_request_received",
-                                        "from": username
-                                    }))
-                            else:
-                                await websocket.send_text(json.dumps({"type": "add_friend_response", "success": False, "message": "Request already sent or error!"}))
-                                
-                        elif msg_type == "accept_friend":
-                            friend_id = msg.get("friend_id")
-                            if not friend_id:
-                                continue
-                            accept_friend_request(user_id, friend_id)
-                            await send_friend_list(username)
-                            await send_friend_requests(username)
-                            # اطلاع به طرف مقابل
-                            friend_username = get_username_by_id(friend_id)
-                            if friend_username and friend_username in connected_users:
-                                await connected_users[friend_username].send_text(json.dumps({
-                                    "type": "friend_request_accepted",
-                                    "from": username
-                                }))
-                                
-                        elif msg_type == "get_friends":
-                            await send_friend_list(username)
-                            
-                        elif msg_type == "get_friend_requests":
-                            await send_friend_requests(username)
-                            
-                    except WebSocketDisconnect:
-                        break
-                        
+        raw = await websocket.receive_text()
+        try:
+            data = json.loads(raw)
+        except:
+            await websocket.send_text(json.dumps({"type": "error", "code": 400, "message": "Invalid JSON"}))
+            await websocket.close()
+            return
+
+        msg_type = data.get("type")
+
+        # ---------- REGISTER ----------
+        if msg_type == "register":
+            username_val = data.get("username", "").strip()
+            password_val = data.get("password", "")
+            if not username_val or not password_val or len(password_val) < 4:
+                await websocket.send_text(json.dumps({
+                    "type": "register_response",
+                    "success": False,
+                    "message": "Invalid username or password (min 4 chars)"
+                }))
+                await websocket.close()
+                return
+            if len(username_val) > MAX_USERNAME_LENGTH:
+                await websocket.send_text(json.dumps({
+                    "type": "register_response",
+                    "success": False,
+                    "message": f"Username too long (max {MAX_USERNAME_LENGTH})"
+                }))
+                await websocket.close()
+                return
+            if username_val in app.state.users:
+                await websocket.send_text(json.dumps({
+                    "type": "register_response",
+                    "success": False,
+                    "message": "Username already taken"
+                }))
+                await websocket.close()
+                return
+            user_id = str(uuid.uuid4())
+            app.state.users[username_val] = {
+                "user_id": user_id,
+                "password": password_val,  # In production: hash this!
+                "created_at": time.time()
+            }
+            await websocket.send_text(json.dumps({
+                "type": "register_response",
+                "success": True,
+                "message": "Registration successful"
+            }))
+            await websocket.close()
+            return
+
+        # ---------- LOGIN ----------
+        if msg_type == "login":
+            username_val = data.get("username", "").strip()
+            password_val = data.get("password", "")
+            if not username_val or not password_val:
+                await websocket.send_text(json.dumps({
+                    "type": "login_response",
+                    "success": False,
+                    "message": "Missing credentials"
+                }))
+                await websocket.close()
+                return
+            user_data = app.state.users.get(username_val)
+            if not user_data:
+                await websocket.send_text(json.dumps({
+                    "type": "login_response",
+                    "success": False,
+                    "message": "User not found"
+                }))
+                await websocket.close()
+                return
+            if user_data["password"] != password_val:
+                await websocket.send_text(json.dumps({
+                    "type": "login_response",
+                    "success": False,
+                    "message": "Invalid password"
+                }))
+                await websocket.close()
+                return
+            user_id = user_data["user_id"]
+            username = username_val
+
+            app.state.connections[user_id] = websocket
+            app.state.users[username_val]["connected_at"] = time.time()
+
+            await websocket.send_text(json.dumps({
+                "type": "login_response",
+                "success": True,
+                "username": username,
+                "user_id": user_id,
+            }))
+
+            logger.info(f"✅ User {username} ({user_id}) logged in")
+            await broadcast_user_list()
+
+            # ---------- MAIN MESSAGE LOOP ----------
+            while True:
+                try:
+                    raw = await websocket.receive_text()
+                    data = json.loads(raw)
+                    await handle_message(user_id, username, data, websocket)
+                except json.JSONDecodeError:
+                    await websocket.send_text(json.dumps({"type": "error", "code": 400, "message": "Invalid JSON"}))
+                except WebSocketDisconnect:
+                    break
+                except Exception as e:
+                    logger.error(f"❌ Message error: {e}")
+                    await websocket.send_text(json.dumps({"type": "error", "code": 500, "message": str(e)}))
+
+            await cleanup_user(user_id, username)
+            return
+
+        else:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "code": 400,
+                "message": "First message must be 'login' or 'register'"
+            }))
+            await websocket.close()
+            return
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        print(f"⚠️ Error: {e}")
+        logger.error(f"❌ WebSocket error: {e}")
     finally:
-        if username in connected_users:
-            del connected_users[username]
-            if username in user_sessions:
-                del user_sessions[username]
+        if user_id and username:
+            await cleanup_user(user_id, username)
+
+# ============================================================
+# Cleanup
+# ============================================================
+async def cleanup_user(user_id: str, username: str):
+    room_id = app.state.user_rooms.get(user_id)
+    if room_id:
+        await leave_room(user_id, room_id)
+    app.state.connections.pop(user_id, None)
+    app.state.user_rooms.pop(user_id, None)
+    await broadcast_user_list()
+
+# ============================================================
+# Message Handler
+# ============================================================
+async def handle_message(user_id: str, username: str, data: dict, websocket: WebSocket):
+    msg_type = data.get("type")
+
+    if msg_type == "ping":
+        await websocket.send_text(json.dumps({"type": "pong"}))
+        return
+
+    elif msg_type == "get_user_list":
+        await send_user_list(websocket)
+
+    elif msg_type == "chat_message":
+        message = data.get("message", "").strip()
+        if not message or len(message) > 500:
+            return
+        room_id = app.state.user_rooms.get(user_id)
+        if room_id:
+            room = app.state.rooms.get(room_id)
+            if room:
+                for uid in room.get("players", []):
+                    if uid in app.state.connections:
+                        try:
+                            await app.state.connections[uid].send_text(json.dumps({
+                                "type": "chat_message",
+                                "sender": username,
+                                "message": message,
+                                "room_id": room_id,
+                            }))
+                        except:
+                            pass
+
+    elif msg_type == "create_room":
+        game_name = data.get("game_name", "Unknown Game")
+        max_players = min(data.get("max_players", 8), MAX_PLAYERS_PER_ROOM)
+
+        user_rooms = [r for r in app.state.rooms.values() if user_id in r.get("players", [])]
+        if len(user_rooms) >= MAX_ROOMS_PER_USER:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "code": 429,
+                "message": f"Maximum {MAX_ROOMS_PER_USER} rooms per user",
+            }))
+            return
+
+        room_id = generate_room_id()
+        while room_id in app.state.rooms:
+            room_id = generate_room_id()
+
+        subnet = generate_subnet()
+        while subnet in app.state.ip_pools:
+            subnet = generate_subnet()
+
+        app.state.ip_pools[subnet] = {f"{subnet}1"}
+        host_ip = f"{subnet}1"
+
+        room_key = secrets.token_hex(16)
+        room_data = {
+            "room_id": room_id,
+            "game_name": game_name,
+            "host": user_id,
+            "host_username": username,
+            "host_ip": host_ip,
+            "players": [user_id],
+            "player_usernames": [username],
+            "player_ips": {user_id: host_ip},
+            "subnet": subnet,
+            "room_key": room_key,
+            "max_players": max_players,
+            "created_at": time.time(),
+            "last_activity": time.time(),
+        }
+        app.state.rooms[room_id] = room_data
+        app.state.user_rooms[user_id] = room_id
+
+        await websocket.send_text(json.dumps({
+            "type": "room_created",
+            "room": {
+                "room_id": room_id,
+                "game_name": game_name,
+                "host": username,
+                "subnet": subnet,
+                "room_key": room_key,
+                "max_players": max_players,
+                "players": [username],
+                "ip": host_ip,
+            },
+            "subnet": subnet,
+            "room_key": room_key,
+            "host_ip": host_ip,
+        }))
+        logger.info(f"🏠 Room {room_id} created by {username} ({subnet})")
+        await broadcast_user_list()
+        await broadcast_room_list()
+
+    elif msg_type == "join_room":
+        room_id = data.get("room_id")
+        if not room_id or room_id not in app.state.rooms:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "code": 404,
+                "message": "Room not found",
+            }))
+            return
+
+        room = app.state.rooms[room_id]
+        if len(room["players"]) >= room["max_players"]:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "code": 403,
+                "message": "Room is full",
+            }))
+            return
+
+        current = app.state.user_rooms.get(user_id)
+        if current:
+            await leave_room(user_id, current)
+
+        subnet = room["subnet"]
+        used_ips = set(room.get("player_ips", {}).values())
+        app.state.ip_pools[subnet] = used_ips.union({f"{subnet}1"})
+
+        player_ip = get_next_ip(subnet, used_ips)
+        if not player_ip:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "code": 500,
+                "message": "No IP available in subnet",
+            }))
+            return
+
+        room["players"].append(user_id)
+        room["player_usernames"].append(username)
+        room["player_ips"][user_id] = player_ip
+        room["last_activity"] = time.time()
+        app.state.user_rooms[user_id] = room_id
+
+        await websocket.send_text(json.dumps({
+            "type": "room_joined",
+            "room": {
+                "room_id": room_id,
+                "game_name": room["game_name"],
+                "host": room["host_username"],
+                "subnet": subnet,
+                "room_key": room["room_key"],
+                "players": room["player_usernames"],
+                "ips": room["player_ips"],
+                "max_players": room["max_players"],
+            },
+            "subnet": subnet,
+            "room_key": room["room_key"],
+            "my_ip": player_ip,
+        }))
+        logger.info(f"👤 {username} joined room {room_id} with IP {player_ip}")
+        await broadcast_room_players(room_id)
+        await broadcast_user_list()
+        await broadcast_room_list()
+
+    elif msg_type == "leave_room":
+        room_id = app.state.user_rooms.get(user_id)
+        if room_id:
+            await leave_room(user_id, room_id)
+            await websocket.send_text(json.dumps({
+                "type": "left_room",
+                "room_id": room_id,
+            }))
             await broadcast_user_list()
+            await broadcast_room_list()
 
-def get_username_by_id(user_id):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('SELECT username FROM users WHERE id = ?', (user_id,))
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else None
+    elif msg_type == "get_room_list":
+        await send_room_list(websocket)
 
-async def send_friend_list(username):
-    user_id = get_user_id(username)
-    if not user_id or username not in connected_users:
+    elif msg_type == "offer":
+        target = data.get("target")
+        sdp = data.get("sdp")
+        game_name = data.get("game_name", "")
+
+        if not target or target not in app.state.connections:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "code": 404,
+                "message": "Target user not online",
+            }))
+            return
+
+        room_id = app.state.user_rooms.get(user_id)
+        if not room_id:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "code": 403,
+                "message": "You must be in a room to send offers",
+            }))
+            return
+
+        await app.state.connections[target].send_text(json.dumps({
+            "type": "offer_received",
+            "from": username,
+            "from_id": user_id,
+            "sdp": sdp,
+            "game_name": game_name,
+            "room_id": room_id,
+        }))
+
+    elif msg_type == "answer":
+        target = data.get("target")
+        sdp = data.get("sdp")
+
+        if not target or target not in app.state.connections:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "code": 404,
+                "message": "Target user not online",
+            }))
+            return
+
+        await app.state.connections[target].send_text(json.dumps({
+            "type": "answer_received",
+            "from": username,
+            "from_id": user_id,
+            "sdp": sdp,
+        }))
+
+    elif msg_type == "ice_candidate":
+        target = data.get("target")
+        candidate = data.get("candidate")
+
+        if not target or target not in app.state.connections:
+            return
+
+        await app.state.connections[target].send_text(json.dumps({
+            "type": "ice_candidate_received",
+            "from": username,
+            "from_id": user_id,
+            "candidate": candidate,
+        }))
+
+# ============================================================
+# Room Management
+# ============================================================
+async def leave_room(user_id: str, room_id: str):
+    room = app.state.rooms.get(room_id)
+    if not room:
         return
-    friends = get_friends(user_id)
-    friend_list = [{"username": f[0], "status": f[1]} for f in friends]
-    await connected_users[username].send_text(json.dumps({
-        "type": "friend_list",
-        "friends": friend_list
-    }))
 
-async def send_friend_requests(username):
-    user_id = get_user_id(username)
-    if not user_id or username not in connected_users:
+    if user_id in room["players"]:
+        room["players"].remove(user_id)
+        username = next((u for u, uid in app.state.users.items() if uid.get("user_id") == user_id), "")
+        if username in room["player_usernames"]:
+            room["player_usernames"].remove(username)
+        room["player_ips"].pop(user_id, None)
+        room["last_activity"] = time.time()
+
+    app.state.user_rooms.pop(user_id, None)
+
+    if not room["players"]:
+        del app.state.rooms[room_id]
+        subnet = room["subnet"]
+        app.state.ip_pools.pop(subnet, None)
+        logger.info(f"🗑️ Room {room_id} deleted (empty)")
+    else:
+        if room["host"] == user_id:
+            room["host"] = room["players"][0]
+            room["host_username"] = room["player_usernames"][0]
+            room["host_ip"] = room["player_ips"][room["players"][0]]
+            logger.info(f"👑 New host for {room_id}: {room['host_username']}")
+        await broadcast_room_players(room_id)
+
+async def broadcast_room_players(room_id: str):
+    room = app.state.rooms.get(room_id)
+    if not room:
         return
-    requests = get_friend_requests(user_id)
-    request_list = [{"id": r[0], "username": r[1]} for r in requests]
-    await connected_users[username].send_text(json.dumps({
-        "type": "friend_requests",
-        "requests": request_list
-    }))
 
-async def broadcast(data, exclude=None):
-    for name, ws in list(connected_users.items()):
-        if name != exclude:
+    for uid in room["players"]:
+        if uid in app.state.connections:
             try:
-                await ws.send_text(json.dumps(data))
+                await app.state.connections[uid].send_text(json.dumps({
+                    "type": "room_players",
+                    "room_id": room_id,
+                    "players": room["player_usernames"],
+                    "ips": room["player_ips"],
+                    "host": room["host_username"],
+                    "subnet": room["subnet"],
+                    "room_key": room["room_key"],
+                }))
             except:
                 pass
 
 async def broadcast_user_list():
-    await broadcast({"type": "user_list", "users": list(connected_users.keys())})
+    user_list = []
+    for username, user in app.state.users.items():
+        if user.get("user_id") in app.state.connections:
+            user_list.append(username)
 
+    for uid, ws in app.state.connections.items():
+        try:
+            await ws.send_text(json.dumps({
+                "type": "user_list",
+                "users": user_list,
+            }))
+        except:
+            pass
+
+async def broadcast_room_list():
+    room_list = []
+    for room_id, room in app.state.rooms.items():
+        room_list.append({
+            "room_id": room_id,
+            "game": room["game_name"],
+            "host": room["host_username"],
+            "count": len(room["players"]),
+            "max": room["max_players"],
+        })
+
+    for uid, ws in app.state.connections.items():
+        try:
+            await ws.send_text(json.dumps({
+                "type": "room_list",
+                "rooms": room_list,
+            }))
+        except:
+            pass
+
+async def send_user_list(websocket: WebSocket):
+    user_list = []
+    for username, user in app.state.users.items():
+        if user.get("user_id") in app.state.connections:
+            user_list.append(username)
+    await websocket.send_text(json.dumps({
+        "type": "user_list",
+        "users": user_list,
+    }))
+
+async def send_room_list(websocket: WebSocket):
+    room_list = []
+    for room_id, room in app.state.rooms.items():
+        room_list.append({
+            "room_id": room_id,
+            "game": room["game_name"],
+            "host": room["host_username"],
+            "count": len(room["players"]),
+            "max": room["max_players"],
+        })
+    await websocket.send_text(json.dumps({
+        "type": "room_list",
+        "rooms": room_list,
+    }))
+
+# ============================================================
+# Health Check
+# ============================================================
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "version": VERSION,
+        "users": len(app.state.users),
+        "rooms": len(app.state.rooms),
+        "connections": len(app.state.connections),
+    }
+
+# ============================================================
+# Run
+# ============================================================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        workers=1,
+    )
