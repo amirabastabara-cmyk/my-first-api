@@ -1,34 +1,22 @@
 # main.py
-# VoidVision Server v30
-# FastAPI + SQLite + WebSocket
+# VoidVision Server v28
+# FastAPI lightweight edition
 
 import os
 import json
 import uuid
-import sqlite3
 import bcrypt
 import jwt
 
 from datetime import datetime, timedelta
 
-from fastapi import (
-    FastAPI,
-    WebSocket,
-    WebSocketDisconnect,
-    HTTPException
-)
-
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
-
-# =========================
-# APP
-# =========================
 
 app = FastAPI(
     title="VoidVision Server",
-    version="30.0"
+    version="28.0"
 )
 
 
@@ -37,133 +25,51 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 
-# =========================
-# CONFIG
-# =========================
+# ================= CONFIG =================
 
 JWT_SECRET = os.getenv(
     "JWT_SECRET",
-    "voidvision-secret-change"
+    "voidvision-secret"
 )
 
 JWT_ALGORITHM = "HS256"
 
-TOKEN_TIME = 60 * 24 * 7
+TOKEN_EXPIRE = 60 * 24 * 7
 
 
-DATABASE = "voidvision.db"
+# ================= DATABASE =================
 
+users = {}
 
+online_users = {}
 
-# =========================
-# DATABASE
-# =========================
+rooms = {}
 
+friends = {}
 
-def db():
-
-    conn = sqlite3.connect(
-        DATABASE,
-        check_same_thread=False
-    )
-
-    conn.row_factory = sqlite3.Row
-
-    return conn
+requests = {}
 
 
 
-def init_db():
-
-    con = db()
-
-    cur = con.cursor()
+# ================= HELPERS =================
 
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-
-        id TEXT PRIMARY KEY,
-        username TEXT UNIQUE,
-        password TEXT
-
-    )
-    """)
-
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS friends(
-
-        user TEXT,
-        friend TEXT
-
-    )
-    """)
-
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS requests(
-
-        sender TEXT,
-        receiver TEXT
-
-    )
-    """)
-
-
-    con.commit()
-
-    con.close()
-
-
-
-init_db()
-
-
-
-# =========================
-# MODELS
-# =========================
-
-
-class RegisterModel(BaseModel):
-
-    username:str
-    password:str
-
-
-
-class LoginModel(BaseModel):
-
-    username:str
-    password:str
-
-
-
-
-# =========================
-# JWT
-# =========================
-
-
-def create_token(username, uid):
+def make_token(username, user_id):
 
     payload = {
 
         "sub": username,
 
-        "uid": uid,
+        "uid": user_id,
 
         "exp":
         datetime.utcnow()
         +
-        timedelta(
-            minutes=TOKEN_TIME
-        )
+        timedelta(minutes=TOKEN_EXPIRE)
 
     }
 
@@ -176,38 +82,60 @@ def create_token(username, uid):
 
 
 
-def decode_token(token):
+def check_token(token):
 
     return jwt.decode(
         token,
         JWT_SECRET,
-        algorithms=[
-            JWT_ALGORITHM
-        ]
+        algorithms=[JWT_ALGORITHM]
     )
 
 
 
-# =========================
-# REGISTER
-# =========================
+# ================= BASIC TEST =================
+
+
+@app.get("/")
+async def root():
+
+    return {
+
+        "status":"online",
+
+        "server":"VoidVision",
+
+        "version":"28"
+
+    }
+
+
+
+# ================= REGISTER =================
 
 
 @app.post("/api/register")
-async def register(data:RegisterModel):
+async def register(data:dict):
+
+    username = str(
+        data.get("username","")
+    ).strip()
 
 
-    username = data.username.strip()
-
-    password = data.password.strip()
+    password = str(
+        data.get("password","")
+    ).strip()
 
 
 
     if len(username)<3:
 
         return {
+
             "success":False,
-            "message":"Username too short"
+
+            "message":
+            "username too short"
+
         }
 
 
@@ -215,66 +143,58 @@ async def register(data:RegisterModel):
     if len(password)<4:
 
         return {
+
             "success":False,
-            "message":"Password too short"
+
+            "message":
+            "password too short"
+
         }
 
 
 
-    con=db()
 
-    cur=con.cursor()
-
-
-
-    cur.execute(
-        "SELECT username FROM users WHERE username=?",
-        (username,)
-    )
-
-
-    if cur.fetchone():
-
-        con.close()
+    if username in users:
 
         return {
 
             "success":False,
 
-            "message":"Username exists"
+            "message":
+            "already exists"
 
         }
 
 
 
+    hashed = bcrypt.hashpw(
 
-    uid=str(uuid.uuid4())
-
-
-
-    hashed=bcrypt.hashpw(
         password.encode(),
-        bcrypt.gensalt()
+
+        bcrypt.gensalt(10)
+
     )
 
 
 
-    cur.execute(
-        """
-        INSERT INTO users
-        VALUES(?,?,?)
-        """,
-        (
-            uid,
-            username,
-            hashed.decode()
-        )
-    )
+    uid = str(uuid.uuid4())
 
 
-    con.commit()
 
-    con.close()
+    users[username]={
+
+        "id":uid,
+
+        "password":
+        hashed.decode()
+
+    }
+
+
+
+    friends[username]=[]
+
+    requests[username]=[]
 
 
 
@@ -282,7 +202,8 @@ async def register(data:RegisterModel):
 
         "success":True,
 
-        "message":"Account created"
+        "message":
+        "registered"
 
     }
 
@@ -290,80 +211,67 @@ async def register(data:RegisterModel):
 
 
 
-# =========================
-# LOGIN
-# =========================
+# ================= LOGIN =================
 
 
 @app.post("/api/login")
-async def login(data:LoginModel):
+async def login(data:dict):
 
 
-    username=data.username.strip()
-
-    password=data.password.strip()
-
-
-
-    con=db()
-
-    cur=con.cursor()
+    username=str(
+        data.get("username","")
+    ).strip()
 
 
+    password=str(
+        data.get("password","")
+    ).strip()
 
-    cur.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE username=?
-        """,
-        (username,)
+
+
+    if username not in users:
+
+        raise HTTPException(
+            401,
+            "wrong login"
+        )
+
+
+
+    user=users[username]
+
+
+
+    ok=bcrypt.checkpw(
+
+        password.encode(),
+
+        user["password"].encode()
+
     )
 
 
-    user=cur.fetchone()
 
-
-    con.close()
-
-
-
-    if not user:
+    if not ok:
 
         raise HTTPException(
             401,
-            "Wrong username or password"
+            "wrong login"
         )
 
 
 
-    stored=user["password"].encode()
+    token=make_token(
 
-
-
-    if not bcrypt.checkpw(
-        password.encode(),
-        stored
-    ):
-
-
-        raise HTTPException(
-            401,
-            "Wrong username or password"
-        )
-
-
-
-
-    token=create_token(
         username,
+
         user["id"]
+
     )
 
 
 
     return {
-
 
         "access_token":token,
 
@@ -371,61 +279,58 @@ async def login(data:LoginModel):
 
         "username":username,
 
-        "user_id":user["id"]
+        "user_id":
+        user["id"]
 
     }
 
 
 
 
-
-# =========================
-# ONLINE SYSTEM
-# =========================
+# ================= WEBSOCKET =================
 
 
-online_users={}
-
-
-
-class ConnectionManager:
+class Manager:
 
 
     def __init__(self):
 
         self.connections=[]
 
+        self.names={}
 
 
-    async def connect(
+
+
+    async def add(
         self,
         ws,
         username
     ):
 
-        await ws.accept()
-
         self.connections.append(ws)
+
+        self.names[ws]=username
 
         online_users[username]=ws
 
 
 
 
-    def disconnect(
-        self,
-        ws
-    ):
+    def remove(self,ws):
+
+        name=self.names.pop(
+            ws,
+            None
+        )
 
 
-        for name,sock in list(
-            online_users.items()
-        ):
+        if name:
 
-            if sock==ws:
-
-                del online_users[name]
-
+            online_users.pop(
+                name,
+                None
+            )
 
 
         if ws in self.connections:
@@ -450,13 +355,13 @@ class ConnectionManager:
 
 
 
+
     async def broadcast(
         self,
         data
     ):
 
-
-        for ws in self.connections:
+        for ws in self.connections[:]:
 
             try:
 
@@ -468,18 +373,14 @@ class ConnectionManager:
 
 
 
-manager=ConnectionManager()
+
+manager=Manager()
 
 
-
-# =========================
-# WEBSOCKET
-# =========================
 
 
 @app.websocket("/ws")
 async def websocket(ws:WebSocket):
-
 
     await ws.accept()
 
@@ -490,7 +391,6 @@ async def websocket(ws:WebSocket):
 
     try:
 
-
         while True:
 
 
@@ -500,74 +400,67 @@ async def websocket(ws:WebSocket):
             msg=json.loads(raw)
 
 
-            t=msg.get("type")
+            typ=msg.get("type")
 
 
 
-            # AUTH
+            # ===== AUTH =====
 
 
-            if t=="auth":
-
-
-                token=msg.get("token")
+            if typ=="auth":
 
 
                 try:
 
-
-                    data=decode_token(token)
-
-
-                    current=data["sub"]
-
-
-
-                    await manager.connect(
-                        ws,
-                        current
+                    payload=check_token(
+                        msg.get("token")
                     )
 
 
+                    username=payload["sub"]
 
-                    await ws.send_json({
 
-                        "type":"auth_response",
+                    if username not in users:
 
-                        "success":True,
-
-                        "username":current
-
-                    })
+                        raise Exception()
 
 
 
-                    await manager.broadcast({
-
-                        "type":"user_list",
-
-                        "users":
-                        list(
-                            online_users.keys()
-                        )
-
-                    })
+                    await manager.add(
+                        ws,
+                        username
+                    )
 
 
+                    current=username
 
-                except Exception as e:
 
 
                     await ws.send_json({
 
-                        "type":"auth_response",
+                        "type":
+                        "auth_response",
 
-                        "success":False,
+                        "success":
+                        True,
 
-                        "message":str(e)
+                        "username":
+                        username
 
                     })
 
+
+                except:
+
+                    await ws.send_json({
+
+                        "type":
+                        "auth_response",
+
+                        "success":
+                        False
+
+                    })
 
 
                 continue
@@ -576,101 +469,117 @@ async def websocket(ws:WebSocket):
 
             if not current:
 
-
                 await ws.send_json({
 
-                    "type":"error",
-
-                    "message":"Login first"
+                    "error":
+                    "login first"
 
                 })
 
-
                 continue
-            # جلوگیری از استفاده بدون لاگین
+            # ================= ROOM LIST =================
 
-            if not current:
-                await ws.send_json({
-                    "type":"error",
-                    "message":"not authenticated"
-                })
-                continue
+            if typ == "get_room_list":
 
+                result = []
 
+                for rid, room in rooms.items():
 
-            # ================= ROOMS =================
+                    result.append({
 
+                        "room_id": rid,
 
-            if typ=="get_room_list":
+                        "room_name": room["name"],
 
-                data=[]
+                        "players":
+                        len(room["players"]),
 
-                for rid,room in rooms.items():
-
-                    data.append({
-
-                        "room_id":rid,
-                        "room_name":room["name"],
-                        "players":len(room["players"]),
-                        "max":room["max"]
+                        "max":
+                        room["max"]
 
                     })
 
 
                 await ws.send_json({
 
-                    "type":"room_list",
-                    "rooms":data
+                    "type":
+                    "room_list",
+
+                    "rooms":
+                    result
 
                 })
 
 
 
-            elif typ=="create_room":
+            # ================= CREATE ROOM =================
 
 
-                room_id=str(uuid.uuid4())[:8]
+            elif typ == "create_room":
+
+
+                room_id = str(uuid.uuid4())[:6]
 
 
                 rooms[room_id]={
 
-                    "name":msg.get(
+
+                    "name":
+                    msg.get(
                         "room_name",
-                        "Void Room"
+                        "Room"
                     ),
 
-                    "password":msg.get(
+
+                    "password":
+                    msg.get(
                         "password",
                         ""
                     ),
 
-                    "max":msg.get(
-                        "max_players",
-                        8
+
+                    "host":
+                    current,
+
+
+                    "players":[
+                        current
+                    ],
+
+
+                    "max":
+                    int(
+                        msg.get(
+                            "max_players",
+                            8
+                        )
                     ),
 
-                    "host":current,
 
-                    "players":[current],
+                    "key":
+                    str(
+                        uuid.uuid4()
+                    )
 
-                    "key":str(uuid.uuid4())
 
                 }
 
 
+
                 await ws.send_json({
 
-                    "type":"room_created",
+                    "type":
+                    "room_created",
+
 
                     "room":{
 
-                        "room_id":room_id,
+                        "id":
+                        room_id,
 
-                        "room_key":
-                        rooms[room_id]["key"],
 
-                        "subnet":
-                        "10.77.0."
+                        "key":
+                        rooms[room_id]["key"]
 
                     }
 
@@ -680,7 +589,8 @@ async def websocket(ws:WebSocket):
 
                 await manager.broadcast({
 
-                    "type":"room_update"
+                    "type":
+                    "room_update"
 
                 })
 
@@ -688,98 +598,86 @@ async def websocket(ws:WebSocket):
 
 
 
+            # ================= JOIN ROOM =================
+
+
             elif typ=="join_room":
 
 
-                rid=msg.get("room_id")
+                rid=msg.get(
+                    "room_id"
+                )
 
 
                 if rid not in rooms:
 
+
                     await ws.send_json({
 
-                        "type":"room_joined",
+                        "type":
+                        "error",
 
-                        "success":False,
-
-                        "message":"room not found"
+                        "message":
+                        "room not found"
 
                     })
 
+
                     continue
+
 
 
 
                 room=rooms[rid]
 
 
+
                 if room["password"]:
+
 
                     if room["password"] != msg.get("password",""):
 
+
                         await ws.send_json({
 
-                            "type":"room_joined",
+                            "type":
+                            "error",
 
-                            "success":False,
-
-                            "message":"wrong password"
+                            "message":
+                            "wrong password"
 
                         })
 
+
                         continue
-
-
 
                 if current not in room["players"]:
 
-                    if len(room["players"]) >= room["max"]:
 
-                        await ws.send_json({
-
-                            "type":"room_joined",
-
-                            "success":False,
-
-                            "message":"room full"
-
-                        })
-
-                        continue
-
-
-                    room["players"].append(current)
-
-
-
-
-                ips={}
-
-
-                for i,p in enumerate(room["players"]):
-
-                    ips[p]=f"10.77.0.{i+1}"
-
+                    room["players"].append(
+                        current
+                    )
 
 
 
                 await ws.send_json({
 
-                    "type":"room_joined",
+                    "type":
+                    "room_joined",
 
-                    "success":True,
 
                     "room":{
 
-                        "room_id":rid,
+                        "id":
+                        rid,
 
-                        "key":room["key"],
 
-                        "players":room["players"],
+                        "players":
+                        room["players"],
 
-                        "ips":ips,
 
-                        "host":room["host"]
+                        "host":
+                        room["host"]
 
                     }
 
@@ -787,17 +685,19 @@ async def websocket(ws:WebSocket):
 
 
 
+
                 await manager.broadcast({
 
-                    "type":"room_players",
+                    "type":
+                    "room_players",
 
-                    "room":rid,
 
-                    "players":room["players"],
+                    "players":
+                    room["players"],
 
-                    "ips":ips,
 
-                    "host":room["host"]
+                    "host":
+                    room["host"]
 
                 })
 
@@ -805,6 +705,7 @@ async def websocket(ws:WebSocket):
 
 
 
+            # ================= LEAVE =================
 
 
             elif typ=="leave_room":
@@ -816,21 +717,15 @@ async def websocket(ws:WebSocket):
                     if current in room["players"]:
 
 
-                        room["players"].remove(current)
+                        room["players"].remove(
+                            current
+                        )
 
 
-                        if len(room["players"])==0 or room["host"]==current:
+                        if not room["players"]:
+
 
                             del rooms[rid]
-
-
-                            await manager.broadcast({
-
-                                "type":"room_closed",
-
-                                "room_id":rid
-
-                            })
 
 
 
@@ -840,7 +735,8 @@ async def websocket(ws:WebSocket):
 
                 await ws.send_json({
 
-                    "type":"left_room"
+                    "type":
+                    "left_room"
 
                 })
 
@@ -848,15 +744,15 @@ async def websocket(ws:WebSocket):
 
 
 
-
-            # ================= WEBRTC SIGNAL =================
-
+            # ================= WEBRTC OFFER =================
 
 
             elif typ=="offer":
 
 
-                target=msg.get("target")
+                target=msg.get(
+                    "target"
+                )
 
 
                 await manager.send(
@@ -865,35 +761,52 @@ async def websocket(ws:WebSocket):
 
                     {
 
-                    "type":"offer_received",
+                    "type":
+                    "offer_received",
 
-                    "from":current,
 
-                    "sdp":msg.get("sdp"),
+                    "from":
+                    current,
 
-                    "game":msg.get("game_name","")
+
+                    "sdp":
+                    msg.get("sdp")
 
                     }
 
                 )
 
 
+
+
+
+            # ================= WEBRTC ANSWER =================
 
 
             elif typ=="answer":
 
 
+                target=msg.get(
+                    "target"
+                )
+
+
                 await manager.send(
 
-                    msg.get("target"),
+                    target,
 
                     {
 
-                    "type":"answer_received",
+                    "type":
+                    "answer_received",
 
-                    "from":current,
 
-                    "sdp":msg.get("sdp")
+                    "from":
+                    current,
+
+
+                    "sdp":
+                    msg.get("sdp")
 
                     }
 
@@ -903,20 +816,33 @@ async def websocket(ws:WebSocket):
 
 
 
+            # ================= ICE =================
+
+
             elif typ=="ice_candidate":
+
+
+                target=msg.get(
+                    "target"
+                )
 
 
                 await manager.send(
 
-                    msg.get("target"),
+                    target,
 
                     {
 
-                    "type":"ice_received",
+                    "type":
+                    "ice_received",
 
-                    "from":current,
 
-                    "candidate":msg.get("candidate")
+                    "from":
+                    current,
+
+
+                    "candidate":
+                    msg.get("candidate")
 
                     }
 
@@ -929,23 +855,24 @@ async def websocket(ws:WebSocket):
             # ================= CHAT =================
 
 
-
             elif typ=="chat_message":
-
-
-                text=msg.get(
-                    "message",
-                    ""
-                )[:500]
 
 
                 await manager.broadcast({
 
-                    "type":"chat_message",
+                    "type":
+                    "chat_message",
 
-                    "sender":current,
 
-                    "message":text
+                    "sender":
+                    current,
+
+
+                    "message":
+                    msg.get(
+                        "message",
+                        ""
+                    )[:500]
 
                 })
 
@@ -953,24 +880,26 @@ async def websocket(ws:WebSocket):
 
 
 
-
-            # ================= FRIEND SYSTEM =================
-
+            # ================= FRIEND REQUEST =================
 
 
             elif typ=="friend_request":
 
 
-                target=msg.get("target")
+                target=msg.get(
+                    "target"
+                )
 
 
                 if target in users:
 
 
-                    friend_requests.setdefault(
+                    requests.setdefault(
                         target,
                         []
-                    ).append(current)
+                    ).append(
+                        current
+                    )
 
 
                     await manager.send(
@@ -981,6 +910,7 @@ async def websocket(ws:WebSocket):
 
                         "type":
                         "friend_request",
+
 
                         "from":
                         current
@@ -996,19 +926,9 @@ async def websocket(ws:WebSocket):
             elif typ=="friend_accept":
 
 
-                target=msg.get("target")
-
-
-                if target in friend_requests.get(
-                    current,
-                    []
-                ):
-
-
-                    friend_requests[current].remove(
-                        target
-                    )
-
+                target=msg.get(
+                    "target"
+                )
 
 
                 friends.setdefault(
@@ -1026,47 +946,40 @@ async def websocket(ws:WebSocket):
 
                 if target not in friends[current]:
 
-                    friends[current].append(target)
-
+                    friends[current].append(
+                        target
+                    )
 
 
                 if current not in friends[target]:
 
-                    friends[target].append(current)
+                    friends[target].append(
+                        current
+                    )
 
 
+                await manager.send(
 
-                await ws.send_json({
+                    target,
 
-                    "type":"friends",
+                    {
 
-                    "list":friends[current]
-
-                })
-
-
+                    "type":
+                    "friend_added",
 
 
+                    "user":
+                    current
 
+                    }
 
-            elif typ=="friend_reject":
-
-
-                target=msg.get("target")
-
-
-                if target in friend_requests.get(current,[]):
-
-                    friend_requests[current].remove(target)
+                )
 
 
 
 
 
-
-
-            # ================= GAME LAUNCH =================
-
+            # ================= READY =================
 
 
             elif typ=="ready_to_launch":
@@ -1074,11 +987,12 @@ async def websocket(ws:WebSocket):
 
                 await manager.broadcast({
 
-                    "type":"player_ready",
+                    "type":
+                    "player_ready",
 
-                    "player":current,
 
-                    "room":msg.get("room_id")
+                    "player":
+                    current
 
                 })
 
@@ -1086,15 +1000,20 @@ async def websocket(ws:WebSocket):
 
 
 
+            # ================= LAUNCH =================
+
 
             elif typ=="launch_game":
 
 
-                rid=msg.get("room_id")
+                rid=msg.get(
+                    "room_id"
+                )
 
 
-                room=rooms.get(rid)
-
+                room=rooms.get(
+                    rid
+                )
 
 
                 if room and room["host"]==current:
@@ -1102,19 +1021,16 @@ async def websocket(ws:WebSocket):
 
                     await manager.broadcast({
 
-                        "type":"launch_game",
+                        "type":
+                        "launch_game_command",
+
 
                         "game":
-                        msg.get("game_name"),
-
-                        "room":
-                        rid
+                        msg.get(
+                            "game_name"
+                        )
 
                     })
-
-
-
-
 
 
 
@@ -1123,10 +1039,11 @@ async def websocket(ws:WebSocket):
 
                 await ws.send_json({
 
-                    "type":"error",
+                    "type":
+                    "unknown",
 
-                    "message":
-                    "unknown command"
+                    "value":
+                    typ
 
                 })
 
@@ -1135,6 +1052,7 @@ async def websocket(ws:WebSocket):
 
     except WebSocketDisconnect:
 
+
         manager.remove(ws)
 
 
@@ -1142,10 +1060,13 @@ async def websocket(ws:WebSocket):
 
             await manager.broadcast({
 
-                "type":"users",
+                "type":
+                "user_list",
 
-                "list":
-                list(online_users.keys())
+                "users":
+                list(
+                    online_users.keys()
+                )
 
             })
 
@@ -1153,12 +1074,21 @@ async def websocket(ws:WebSocket):
 
 
 
-# ================= START =================
+# ================= RUN =================
 
 
 if __name__=="__main__":
 
+
     import uvicorn
+
+
+    port=int(
+        os.getenv(
+            "PORT",
+            8000
+        )
+    )
 
 
     uvicorn.run(
@@ -1167,11 +1097,6 @@ if __name__=="__main__":
 
         host="0.0.0.0",
 
-        port=int(
-            os.getenv(
-                "PORT",
-                8000
-            )
-        )
+        port=port
 
     )
