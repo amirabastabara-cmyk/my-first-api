@@ -1,1102 +1,420 @@
-# main.py
-# VoidVision Server v28
-# FastAPI lightweight edition
-
+# main.py - VoidVision Server (Pure Python, no compilation)
 import os
 import json
 import uuid
 import bcrypt
 import jwt
-
+import hashlib
 from datetime import datetime, timedelta
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 
+app = FastAPI(title="VoidVision Server")
 
-app = FastAPI(
-    title="VoidVision Server",
-    version="28.0"
-)
-
-
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
-
-# ================= CONFIG =================
-
-JWT_SECRET = os.getenv(
-    "JWT_SECRET",
-    "voidvision-secret"
-)
-
+# ================== Config ==================
+JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-on-render")
 JWT_ALGORITHM = "HS256"
+TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+BCRYPT_ROUNDS = 12
+security = HTTPBearer()
 
-TOKEN_EXPIRE = 60 * 24 * 7
+# ================== Models ==================
+class UserRegister(BaseModel):
+    username: str
+    password: str
 
+class UserLogin(BaseModel):
+    username: str
+    password: str
 
-# ================= DATABASE =================
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+    user_id: str
 
-users = {}
-
+# ================== Database ==================
+users_db = {}
 online_users = {}
-
 rooms = {}
-
+friend_requests = {}
 friends = {}
 
-requests = {}
-
-
-
-# ================= HELPERS =================
-
-
-def make_token(username, user_id):
-
+# ================== Helper Functions ==================
+def create_token(username: str, user_id: str) -> str:
     payload = {
-
         "sub": username,
-
-        "uid": user_id,
-
-        "exp":
-        datetime.utcnow()
-        +
-        timedelta(minutes=TOKEN_EXPIRE)
-
+        "user_id": user_id,
+        "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
     }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
+def verify_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    return jwt.encode(
-        payload,
-        JWT_SECRET,
-        algorithm=JWT_ALGORITHM
-    )
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    payload = verify_token(token)
+    username = payload.get("sub")
+    user_id = payload.get("user_id")
+    if username not in users_db or users_db[username]["user_id"] != user_id:
+        raise HTTPException(status_code=401, detail="Invalid user")
+    return {"username": username, "user_id": user_id}
 
-
-
-def check_token(token):
-
-    return jwt.decode(
-        token,
-        JWT_SECRET,
-        algorithms=[JWT_ALGORITHM]
-    )
-
-
-
-# ================= BASIC TEST =================
-
-
-@app.get("/")
-async def root():
-
-    return {
-
-        "status":"online",
-
-        "server":"VoidVision",
-
-        "version":"28"
-
-    }
-
-
-
-# ================= REGISTER =================
-
-
+# ================== REST API ==================
 @app.post("/api/register")
-async def register(data:dict):
-
-    username = str(
-        data.get("username","")
-    ).strip()
-
-
-    password = str(
-        data.get("password","")
-    ).strip()
-
-
-
-    if len(username)<3:
-
-        return {
-
-            "success":False,
-
-            "message":
-            "username too short"
-
-        }
-
-
-
-    if len(password)<4:
-
-        return {
-
-            "success":False,
-
-            "message":
-            "password too short"
-
-        }
-
-
-
-
-    if username in users:
-
-        return {
-
-            "success":False,
-
-            "message":
-            "already exists"
-
-        }
-
-
-
-    hashed = bcrypt.hashpw(
-
-        password.encode(),
-
-        bcrypt.gensalt(10)
-
-    )
-
-
-
-    uid = str(uuid.uuid4())
-
-
-
-    users[username]={
-
-        "id":uid,
-
-        "password":
-        hashed.decode()
-
-    }
-
-
-
-    friends[username]=[]
-
-    requests[username]=[]
-
-
-
-    return {
-
-        "success":True,
-
-        "message":
-        "registered"
-
-    }
-
-
-
-
-
-# ================= LOGIN =================
-
-
-@app.post("/api/login")
-async def login(data:dict):
-
-
-    username=str(
-        data.get("username","")
-    ).strip()
-
-
-    password=str(
-        data.get("password","")
-    ).strip()
-
-
-
-    if username not in users:
-
-        raise HTTPException(
-            401,
-            "wrong login"
-        )
-
-
-
-    user=users[username]
-
-
-
-    ok=bcrypt.checkpw(
-
-        password.encode(),
-
-        user["password"].encode()
-
-    )
-
-
-
-    if not ok:
-
-        raise HTTPException(
-            401,
-            "wrong login"
-        )
-
-
-
-    token=make_token(
-
-        username,
-
-        user["id"]
-
-    )
-
-
-
-    return {
-
-        "access_token":token,
-
-        "token_type":"bearer",
-
-        "username":username,
-
-        "user_id":
-        user["id"]
-
-    }
-
-
-
-
-# ================= WEBSOCKET =================
-
-
-class Manager:
-
-
+async def register(user: UserRegister):
+    username = user.username.strip()
+    password = user.password.strip()
+    if not username or len(password) < 4:
+        return {"success": False, "message": "Username and password (min 4 chars) required"}
+    if username in users_db:
+        return {"success": False, "message": "Username already exists"}
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(BCRYPT_ROUNDS)).decode()
+    user_id = str(uuid.uuid4())
+    users_db[username] = {"password_hash": password_hash, "user_id": user_id}
+    friends[username] = []
+    friend_requests[username] = []
+    return {"success": True, "message": "Registered successfully"}
+
+@app.post("/api/login", response_model=TokenResponse)
+async def login(user: UserLogin):
+    username = user.username.strip()
+    password = user.password.strip()
+    if username not in users_db:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    stored = users_db[username]
+    if not bcrypt.checkpw(password.encode(), stored["password_hash"].encode()):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_token(username, stored["user_id"])
+    return TokenResponse(access_token=token, username=username, user_id=stored["user_id"])
+
+@app.get("/api/verify")
+async def verify(current_user: dict = Depends(get_current_user)):
+    return {"valid": True, "username": current_user["username"], "user_id": current_user["user_id"]}
+
+# ================== WebSocket ==================
+class ConnectionManager:
     def __init__(self):
+        self.active_connections = []
+        self.username_map = {}
 
-        self.connections=[]
+    async def connect(self, websocket: WebSocket, username: str):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        self.username_map[websocket] = username
+        online_users[username] = websocket
 
-        self.names={}
+    def disconnect(self, websocket: WebSocket):
+        username = self.username_map.pop(websocket, None)
+        if username:
+            online_users.pop(username, None)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
-
-
-
-    async def add(
-        self,
-        ws,
-        username
-    ):
-
-        self.connections.append(ws)
-
-        self.names[ws]=username
-
-        online_users[username]=ws
-
-
-
-
-    def remove(self,ws):
-
-        name=self.names.pop(
-            ws,
-            None
-        )
-
-
-        if name:
-
-            online_users.pop(
-                name,
-                None
-            )
-
-
-        if ws in self.connections:
-
-            self.connections.remove(ws)
-
-
-
-
-    async def send(
-        self,
-        username,
-        data
-    ):
-
-        ws=online_users.get(username)
-
+    async def send_to_user(self, username: str, data: dict):
+        ws = online_users.get(username)
         if ws:
-
             await ws.send_json(data)
 
+    async def broadcast(self, data: dict, exclude=None):
+        for conn in self.active_connections:
+            if conn != exclude:
+                try:
+                    await conn.send_json(data)
+                except:
+                    pass
 
-
-
-
-    async def broadcast(
-        self,
-        data
-    ):
-
-        for ws in self.connections[:]:
-
-            try:
-
-                await ws.send_json(data)
-
-            except:
-
-                pass
-
-
-
-
-manager=Manager()
-
-
-
+manager = ConnectionManager()
 
 @app.websocket("/ws")
-async def websocket(ws:WebSocket):
-
-    await ws.accept()
-
-
-    current=None
-
-
-
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    current_user = None
     try:
-
         while True:
-
-
-            raw=await ws.receive_text()
-
-
-            msg=json.loads(raw)
-
-
-            typ=msg.get("type")
-
-
-
-            # ===== AUTH =====
-
-
-            if typ=="auth":
-
-
-                try:
-
-                    payload=check_token(
-                        msg.get("token")
-                    )
-
-
-                    username=payload["sub"]
-
-
-                    if username not in users:
-
-                        raise Exception()
-
-
-
-                    await manager.add(
-                        ws,
-                        username
-                    )
-
-
-                    current=username
-
-
-
-                    await ws.send_json({
-
-                        "type":
-                        "auth_response",
-
-                        "success":
-                        True,
-
-                        "username":
-                        username
-
-                    })
-
-
-                except:
-
-                    await ws.send_json({
-
-                        "type":
-                        "auth_response",
-
-                        "success":
-                        False
-
-                    })
-
-
-                continue
-
-
-
-            if not current:
-
-                await ws.send_json({
-
-                    "error":
-                    "login first"
-
-                })
-
-                continue
-            # ================= ROOM LIST =================
-
-            if typ == "get_room_list":
-
-                result = []
-
-                for rid, room in rooms.items():
-
-                    result.append({
-
-                        "room_id": rid,
-
-                        "room_name": room["name"],
-
-                        "players":
-                        len(room["players"]),
-
-                        "max":
-                        room["max"]
-
-                    })
-
-
-                await ws.send_json({
-
-                    "type":
-                    "room_list",
-
-                    "rooms":
-                    result
-
-                })
-
-
-
-            # ================= CREATE ROOM =================
-
-
-            elif typ == "create_room":
-
-
-                room_id = str(uuid.uuid4())[:6]
-
-
-                rooms[room_id]={
-
-
-                    "name":
-                    msg.get(
-                        "room_name",
-                        "Room"
-                    ),
-
-
-                    "password":
-                    msg.get(
-                        "password",
-                        ""
-                    ),
-
-
-                    "host":
-                    current,
-
-
-                    "players":[
-                        current
-                    ],
-
-
-                    "max":
-                    int(
-                        msg.get(
-                            "max_players",
-                            8
-                        )
-                    ),
-
-
-                    "key":
-                    str(
-                        uuid.uuid4()
-                    )
-
-
-                }
-
-
-
-                await ws.send_json({
-
-                    "type":
-                    "room_created",
-
-
-                    "room":{
-
-                        "id":
-                        room_id,
-
-
-                        "key":
-                        rooms[room_id]["key"]
-
-                    }
-
-                })
-
-
-
-                await manager.broadcast({
-
-                    "type":
-                    "room_update"
-
-                })
-
-
-
-
-
-            # ================= JOIN ROOM =================
-
-
-            elif typ=="join_room":
-
-
-                rid=msg.get(
-                    "room_id"
-                )
-
-
-                if rid not in rooms:
-
-
-                    await ws.send_json({
-
-                        "type":
-                        "error",
-
-                        "message":
-                        "room not found"
-
-                    })
-
-
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+                t = msg.get("type")
+
+                # ---------- AUTH ----------
+                if t == "auth":
+                    token = msg.get("token")
+                    if not token:
+                        await websocket.send_json({"type": "auth_response", "success": False, "message": "No token"})
+                        continue
+                    try:
+                        payload = verify_token(token)
+                        username = payload["sub"]
+                        user_id = payload["user_id"]
+                        if username not in users_db or users_db[username]["user_id"] != user_id:
+                            raise Exception("Invalid user")
+                        if username in online_users:
+                            old = online_users[username]
+                            if old != websocket:
+                                await old.close(code=1000, reason="Duplicate login")
+                        await manager.connect(websocket, username)
+                        current_user = username
+                        await websocket.send_json({
+                            "type": "auth_response",
+                            "success": True,
+                            "username": username,
+                            "user_id": user_id
+                        })
+                        await manager.broadcast({"type": "user_list", "users": list(online_users.keys())})
+                        await websocket.send_json({
+                            "type": "friend_requests_list",
+                            "requests": friend_requests.get(username, [])
+                        })
+                        await websocket.send_json({
+                            "type": "friends_list",
+                            "friends": friends.get(username, [])
+                        })
+                    except Exception as e:
+                        await websocket.send_json({"type": "auth_response", "success": False, "message": str(e)})
                     continue
 
+                if not current_user:
+                    await websocket.send_json({"type": "error", "message": "Not authenticated"})
+                    continue
 
-
-
-                room=rooms[rid]
-
-
-
-                if room["password"]:
-
-
-                    if room["password"] != msg.get("password",""):
-
-
-                        await ws.send_json({
-
-                            "type":
-                            "error",
-
-                            "message":
-                            "wrong password"
-
+                # ---------- ROOM ----------
+                if t == "get_room_list":
+                    room_list = []
+                    for rid, r in rooms.items():
+                        room_list.append({
+                            "room_id": rid,
+                            "room_name": r["name"],
+                            "has_password": bool(r.get("password")),
+                            "count": len(r["players"]),
+                            "max": r["max_players"]
                         })
+                    await websocket.send_json({"type": "room_list", "rooms": room_list})
 
-
-                        continue
-
-                if current not in room["players"]:
-
-
-                    room["players"].append(
-                        current
-                    )
-
-
-
-                await ws.send_json({
-
-                    "type":
-                    "room_joined",
-
-
-                    "room":{
-
-                        "id":
-                        rid,
-
-
-                        "players":
-                        room["players"],
-
-
-                        "host":
-                        room["host"]
-
+                elif t == "create_room":
+                    room_id = str(uuid.uuid4())[:6]
+                    rooms[room_id] = {
+                        "name": msg.get("room_name", "Room"),
+                        "password": msg.get("password", ""),
+                        "max_players": msg.get("max_players", 8),
+                        "host": current_user,
+                        "players": [current_user],
+                        "room_key": str(uuid.uuid4()),
+                        "ips": {current_user: "10.77.0.1"},
+                        "next_ip": 2
                     }
-
-                })
-
-
-
-
-                await manager.broadcast({
-
-                    "type":
-                    "room_players",
-
-
-                    "players":
-                    room["players"],
-
-
-                    "host":
-                    room["host"]
-
-                })
-
-
-
-
-
-            # ================= LEAVE =================
-
-
-            elif typ=="leave_room":
-
-
-                for rid,room in list(rooms.items()):
-
-
-                    if current in room["players"]:
-
-
-                        room["players"].remove(
-                            current
-                        )
-
-
-                        if not room["players"]:
-
-
-                            del rooms[rid]
-
-
-
-                        break
-
-
-
-                await ws.send_json({
-
-                    "type":
-                    "left_room"
-
-                })
-
-
-
-
-
-            # ================= WEBRTC OFFER =================
-
-
-            elif typ=="offer":
-
-
-                target=msg.get(
-                    "target"
-                )
-
-
-                await manager.send(
-
-                    target,
-
-                    {
-
-                    "type":
-                    "offer_received",
-
-
-                    "from":
-                    current,
-
-
-                    "sdp":
-                    msg.get("sdp")
-
-                    }
-
-                )
-
-
-
-
-
-            # ================= WEBRTC ANSWER =================
-
-
-            elif typ=="answer":
-
-
-                target=msg.get(
-                    "target"
-                )
-
-
-                await manager.send(
-
-                    target,
-
-                    {
-
-                    "type":
-                    "answer_received",
-
-
-                    "from":
-                    current,
-
-
-                    "sdp":
-                    msg.get("sdp")
-
-                    }
-
-                )
-
-
-
-
-
-            # ================= ICE =================
-
-
-            elif typ=="ice_candidate":
-
-
-                target=msg.get(
-                    "target"
-                )
-
-
-                await manager.send(
-
-                    target,
-
-                    {
-
-                    "type":
-                    "ice_received",
-
-
-                    "from":
-                    current,
-
-
-                    "candidate":
-                    msg.get("candidate")
-
-                    }
-
-                )
-
-
-
-
-
-            # ================= CHAT =================
-
-
-            elif typ=="chat_message":
-
-
-                await manager.broadcast({
-
-                    "type":
-                    "chat_message",
-
-
-                    "sender":
-                    current,
-
-
-                    "message":
-                    msg.get(
-                        "message",
-                        ""
-                    )[:500]
-
-                })
-
-
-
-
-
-            # ================= FRIEND REQUEST =================
-
-
-            elif typ=="friend_request":
-
-
-                target=msg.get(
-                    "target"
-                )
-
-
-                if target in users:
-
-
-                    requests.setdefault(
-                        target,
-                        []
-                    ).append(
-                        current
-                    )
-
-
-                    await manager.send(
-
-                        target,
-
-                        {
-
-                        "type":
-                        "friend_request",
-
-
-                        "from":
-                        current
-
+                    await websocket.send_json({
+                        "type": "room_created",
+                        "room": {
+                            "room_id": room_id,
+                            "room_name": rooms[room_id]["name"],
+                            "room_key": rooms[room_id]["room_key"],
+                            "subnet": "10.77.0.0"
                         }
+                    })
+                    await manager.broadcast({"type": "room_list", "rooms": []})
 
-                    )
-
-
-
-
-
-            elif typ=="friend_accept":
-
-
-                target=msg.get(
-                    "target"
-                )
-
-
-                friends.setdefault(
-                    current,
-                    []
-                )
-
-
-                friends.setdefault(
-                    target,
-                    []
-                )
-
-
-
-                if target not in friends[current]:
-
-                    friends[current].append(
-                        target
-                    )
-
-
-                if current not in friends[target]:
-
-                    friends[target].append(
-                        current
-                    )
-
-
-                await manager.send(
-
-                    target,
-
-                    {
-
-                    "type":
-                    "friend_added",
-
-
-                    "user":
-                    current
-
-                    }
-
-                )
-
-
-
-
-
-            # ================= READY =================
-
-
-            elif typ=="ready_to_launch":
-
-
-                await manager.broadcast({
-
-                    "type":
-                    "player_ready",
-
-
-                    "player":
-                    current
-
-                })
-
-
-
-
-
-            # ================= LAUNCH =================
-
-
-            elif typ=="launch_game":
-
-
-                rid=msg.get(
-                    "room_id"
-                )
-
-
-                room=rooms.get(
-                    rid
-                )
-
-
-                if room and room["host"]==current:
-
-
+                elif t == "join_room":
+                    room_id = msg.get("room_id")
+                    pwd = msg.get("password", "")
+                    if room_id not in rooms:
+                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Not found"})
+                        continue
+                    room = rooms[room_id]
+                    if room.get("password") and room["password"] != pwd:
+                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Wrong password"})
+                        continue
+                    if len(room["players"]) >= room["max_players"]:
+                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Full"})
+                        continue
+                    if current_user not in room["players"]:
+                        room["players"].append(current_user)
+                        ip_idx = room.get("next_ip", len(room["players"]) + 1)
+                        room["ips"][current_user] = f"10.77.0.{ip_idx}"
+                        room["next_ip"] = ip_idx + 1
+                    await websocket.send_json({
+                        "type": "room_joined",
+                        "room": {
+                            "room_id": room_id,
+                            "room_name": room["name"],
+                            "room_key": room["room_key"],
+                            "subnet": "10.77.0.0",
+                            "players": room["players"],
+                            "ips": room["ips"],
+                            "host": room["host"]
+                        }
+                    })
                     await manager.broadcast({
-
-                        "type":
-                        "launch_game_command",
-
-
-                        "game":
-                        msg.get(
-                            "game_name"
-                        )
-
+                        "type": "room_players",
+                        "players": room["players"],
+                        "ips": room["ips"],
+                        "host": room["host"],
+                        "subnet": "10.77.0.0",
+                        "room_key": room["room_key"]
                     })
 
+                elif t == "leave_room":
+                    for rid, room in list(rooms.items()):
+                        if current_user in room["players"]:
+                            room["players"].remove(current_user)
+                            room["ips"].pop(current_user, None)
+                            if room["host"] == current_user or not room["players"]:
+                                del rooms[rid]
+                                await manager.broadcast({"type": "room_closed", "room_id": rid})
+                            else:
+                                await manager.broadcast({
+                                    "type": "room_players",
+                                    "players": room["players"],
+                                    "ips": room["ips"],
+                                    "host": room["host"],
+                                    "subnet": "10.77.0.0",
+                                    "room_key": room["room_key"]
+                                })
+                            break
+                    await websocket.send_json({"type": "left_room", "success": True})
 
+                # ---------- SIGNALING ----------
+                elif t == "offer":
+                    target = msg.get("target")
+                    sdp = msg.get("sdp")
+                    game = msg.get("game_name", "")
+                    public_key = msg.get("public_key", "")
+                    if target and sdp:
+                        await manager.send_to_user(target, {
+                            "type": "offer_received",
+                            "from": current_user,
+                            "sdp": sdp,
+                            "game_name": game,
+                            "public_key": public_key
+                        })
 
-            else:
+                elif t == "answer":
+                    target = msg.get("target")
+                    sdp = msg.get("sdp")
+                    if target and sdp:
+                        await manager.send_to_user(target, {
+                            "type": "answer_received",
+                            "from": current_user,
+                            "sdp": sdp
+                        })
 
+                elif t == "ice_candidate":
+                    target = msg.get("target")
+                    cand = msg.get("candidate")
+                    if target and cand:
+                        await manager.send_to_user(target, {
+                            "type": "ice_candidate_received",
+                            "from": current_user,
+                            "candidate": cand
+                        })
 
-                await ws.send_json({
+                # ---------- CHAT ----------
+                elif t == "chat_message":
+                    text = msg.get("message", "")[:500]
+                    if current_user and text:
+                        await manager.broadcast({
+                            "type": "chat_message",
+                            "sender": current_user,
+                            "message": text
+                        })
 
-                    "type":
-                    "unknown",
+                # ---------- FRIENDS ----------
+                elif t == "friend_request":
+                    target = msg.get("target")
+                    if target and target in users_db:
+                        if target not in friend_requests.get(target, []):
+                            friend_requests.setdefault(target, []).append(current_user)
+                            await manager.send_to_user(target, {
+                                "type": "friend_request_received",
+                                "from": current_user
+                            })
 
-                    "value":
-                    typ
+                elif t == "friend_accept":
+                    target = msg.get("target")
+                    if target:
+                        if target in friend_requests.get(current_user, []):
+                            friend_requests[current_user].remove(target)
+                        if current_user not in friends.get(target, []):
+                            friends.setdefault(target, []).append(current_user)
+                        if target not in friends.get(current_user, []):
+                            friends.setdefault(current_user, []).append(target)
+                        await manager.send_to_user(target, {
+                            "type": "friend_accepted",
+                            "from": current_user
+                        })
+                        await websocket.send_json({
+                            "type": "friends_list",
+                            "friends": friends.get(current_user, [])
+                        })
+                        await manager.send_to_user(target, {
+                            "type": "friends_list",
+                            "friends": friends.get(target, [])
+                        })
 
-                })
+                elif t == "friend_reject":
+                    target = msg.get("target")
+                    if target and target in friend_requests.get(current_user, []):
+                        friend_requests[current_user].remove(target)
 
+                # ---------- READY & LAUNCH ----------
+                elif t == "ready_to_launch":
+                    await manager.broadcast({
+                        "type": "player_ready",
+                        "player": current_user,
+                        "room": msg.get("room_id")
+                    })
 
+                elif t == "launch_game":
+                    game = msg.get("game_name")
+                    room_id = msg.get("room_id")
+                    room = rooms.get(room_id)
+                    if room and room["host"] == current_user:
+                        await manager.broadcast({
+                            "type": "launch_game_command",
+                            "game": game,
+                            "room_id": room_id
+                        })
 
+                elif t == "invite":
+                    target = msg.get("target")
+                    room_id = msg.get("room_id")
+                    if target and room_id:
+                        await manager.send_to_user(target, {
+                            "type": "game_invite",
+                            "from": current_user,
+                            "room_id": room_id
+                        })
+
+                else:
+                    await websocket.send_json({"type": "error", "message": f"Unknown type: {t}"})
+
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
 
     except WebSocketDisconnect:
+        manager.disconnect(websocket)
+        if current_user:
+            await manager.broadcast({"type": "user_list", "users": list(online_users.keys())})
 
-
-        manager.remove(ws)
-
-
-        if current:
-
-            await manager.broadcast({
-
-                "type":
-                "user_list",
-
-                "users":
-                list(
-                    online_users.keys()
-                )
-
-            })
-
-
-
-
-
-# ================= RUN =================
-
-
-if __name__=="__main__":
-
-
+# ================== ENTRY ==================
+if __name__ == "__main__":
     import uvicorn
-
-
-    port=int(
-        os.getenv(
-            "PORT",
-            8000
-        )
-    )
-
-
-    uvicorn.run(
-
-        app,
-
-        host="0.0.0.0",
-
-        port=port
-
-    )
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
