@@ -1,4 +1,4 @@
-# main.py - VoidVision Server (با Pydantic V2)
+# main.py - با Pydantic V1 و FastAPI 0.68
 import os
 import json
 import uuid
@@ -29,7 +29,7 @@ TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 BCRYPT_ROUNDS = 12
 security = HTTPBearer()
 
-# ================== Models (Pydantic V2) ==================
+# ================== Models (Pydantic V1) ==================
 class UserRegister(BaseModel):
     username: str
     password: str
@@ -77,7 +77,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=401, detail="Invalid user")
     return {"username": username, "user_id": user_id}
 
-# ================== REST API (Login/Register) ==================
+# ================== REST API ==================
 @app.post("/api/register")
 async def register(user: UserRegister):
     username = user.username.strip()
