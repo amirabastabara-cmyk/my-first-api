@@ -1,4 +1,4 @@
-# main.py - VoidVision Server (Full WebSocket, JWT Auth, SQLite, Room System)
+# main.py - VoidVision Server (Stable, Lightweight)
 import os
 import json
 import sqlite3
@@ -11,8 +11,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="VoidVision Server")
-
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,10 +19,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================== Config ==================
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-on-render")
 JWT_ALGORITHM = "HS256"
-TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 
 # ================== Database ==================
 def init_db():
@@ -98,8 +95,7 @@ def verify_token(token):
 
 # ================== WebSocket ==================
 connected_users = {}  # username -> websocket
-user_data = {}        # username -> {"user_id": str, "token": str}
-rooms = {}            # room_id -> {"name": str, "password": str, "host": str, "players": list, "ips": dict, "room_key": str}
+rooms = {}            # room_id -> dict
 room_counter = 0
 
 @app.get("/")
@@ -117,45 +113,33 @@ async def websocket_endpoint(websocket: WebSocket):
                 msg = json.loads(data)
                 msg_type = msg.get("type")
 
-                # ========== REGISTER ==========
+                # ---------- REGISTER ----------
                 if msg_type == "register":
                     username = msg.get("username", "").strip()
                     password = msg.get("password", "").strip()
                     if not username or len(password) < 4:
-                        await websocket.send_text(json.dumps({
-                            "type": "register_response",
-                            "success": False,
-                            "message": "Username and password (min 4 chars) required"
-                        }))
+                        await websocket.send_json({"type": "register_response", "success": False, "message": "Invalid credentials"})
                         continue
                     result = register_user(username, password)
-                    await websocket.send_text(json.dumps({
+                    await websocket.send_json({
                         "type": "register_response",
                         "success": result.get("success", False),
-                        "message": result.get("message", "Registration successful")
-                    }))
+                        "message": result.get("message", "Registered successfully")
+                    })
                     continue
 
-                # ========== LOGIN ==========
+                # ---------- LOGIN ----------
                 if msg_type == "login":
                     username = msg.get("username", "").strip()
                     password = msg.get("password", "").strip()
                     if not username or not password:
-                        await websocket.send_text(json.dumps({
-                            "type": "login_response",
-                            "success": False,
-                            "message": "Username and password required"
-                        }))
+                        await websocket.send_json({"type": "login_response", "success": False, "message": "Username and password required"})
                         continue
                     result = login_user(username, password)
                     if not result.get("success"):
-                        await websocket.send_text(json.dumps({
-                            "type": "login_response",
-                            "success": False,
-                            "message": result.get("message", "Invalid credentials")
-                        }))
+                        await websocket.send_json({"type": "login_response", "success": False, "message": result.get("message", "Invalid credentials")})
                         continue
-                    # Remove old connection if any
+                    # Remove old connection
                     if username in connected_users:
                         try:
                             await connected_users[username].close()
@@ -163,46 +147,31 @@ async def websocket_endpoint(websocket: WebSocket):
                             pass
                         del connected_users[username]
                     token = create_token(username, result["user_id"])
-                    user_data[username] = {"user_id": result["user_id"], "token": token}
                     connected_users[username] = websocket
                     current_user = username
-                    await websocket.send_text(json.dumps({
+                    await websocket.send_json({
                         "type": "login_response",
                         "success": True,
                         "username": username,
                         "user_id": result["user_id"],
                         "token": token
-                    }))
-                    # Broadcast user list
+                    })
                     await broadcast_user_list()
                     continue
 
-                # ========== AUTH ==========
+                # ---------- AUTH ----------
                 if msg_type == "auth":
                     token = msg.get("token")
                     if not token:
-                        await websocket.send_text(json.dumps({
-                            "type": "auth_response",
-                            "success": False,
-                            "message": "No token"
-                        }))
+                        await websocket.send_json({"type": "auth_response", "success": False, "message": "No token"})
                         continue
                     payload = verify_token(token)
                     if not payload:
-                        await websocket.send_text(json.dumps({
-                            "type": "auth_response",
-                            "success": False,
-                            "message": "Invalid token"
-                        }))
+                        await websocket.send_json({"type": "auth_response", "success": False, "message": "Invalid token"})
                         continue
                     username = payload.get("sub")
-                    user_id = payload.get("user_id")
                     if not username or not user_exists(username):
-                        await websocket.send_text(json.dumps({
-                            "type": "auth_response",
-                            "success": False,
-                            "message": "User not found"
-                        }))
+                        await websocket.send_json({"type": "auth_response", "success": False, "message": "User not found"})
                         continue
                     if username in connected_users:
                         try:
@@ -211,34 +180,30 @@ async def websocket_endpoint(websocket: WebSocket):
                             pass
                         del connected_users[username]
                     connected_users[username] = websocket
-                    user_data[username] = {"user_id": user_id, "token": token}
                     current_user = username
-                    await websocket.send_text(json.dumps({
+                    await websocket.send_json({
                         "type": "auth_response",
                         "success": True,
                         "username": username,
-                        "user_id": user_id
-                    }))
+                        "user_id": payload.get("user_id")
+                    })
                     await broadcast_user_list()
                     continue
 
-                # ========== AUTH REQUIRED ==========
+                # ---------- AUTH REQUIRED ----------
                 if not current_user:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Not authenticated"
-                    }))
+                    await websocket.send_json({"type": "error", "message": "Not authenticated"})
                     continue
 
-                # ========== GET USERS ==========
+                # ---------- GET USERS ----------
                 if msg_type == "get_users":
-                    await websocket.send_text(json.dumps({
+                    await websocket.send_json({
                         "type": "user_list",
                         "users": list(connected_users.keys())
-                    }))
+                    })
                     continue
 
-                # ========== CHAT ==========
+                # ---------- CHAT ----------
                 if msg_type == "chat_message":
                     text = msg.get("message", "")[:500]
                     if text:
@@ -246,26 +211,26 @@ async def websocket_endpoint(websocket: WebSocket):
                             "type": "chat_message",
                             "sender": current_user,
                             "message": text
-                        }, exclude=current_user)
+                        })
                     continue
 
-                # ========== GAME INVITE ==========
+                # ---------- GAME INVITE ----------
                 if msg_type == "game_invite":
                     target = msg.get("target")
                     game_name = msg.get("game_name", "Unknown Game")
                     ip = msg.get("ip", "")
                     port = msg.get("port", 0)
                     if target and target in connected_users:
-                        await connected_users[target].send_text(json.dumps({
+                        await connected_users[target].send_json({
                             "type": "game_invite",
                             "sender": current_user,
                             "game_name": game_name,
                             "ip": ip,
                             "port": port
-                        }))
+                        })
                     continue
 
-                # ========== ROOM LIST ==========
+                # ---------- ROOM LIST ----------
                 if msg_type == "get_room_list":
                     room_list = []
                     for rid, room in rooms.items():
@@ -276,29 +241,28 @@ async def websocket_endpoint(websocket: WebSocket):
                             "count": len(room["players"]),
                             "max": 8
                         })
-                    await websocket.send_text(json.dumps({
+                    await websocket.send_json({
                         "type": "room_list",
                         "rooms": room_list
-                    }))
+                    })
                     continue
 
-                # ========== CREATE ROOM ==========
+                # ---------- CREATE ROOM ----------
                 if msg_type == "create_room":
                     room_name = msg.get("room_name", "Room")
                     password = msg.get("password", "")
-                    max_players = msg.get("max_players", 8)
                     room_id = str(uuid.uuid4())[:6]
                     rooms[room_id] = {
                         "name": room_name,
                         "password": password,
-                        "max_players": max_players,
+                        "max_players": 8,
                         "host": current_user,
                         "players": [current_user],
                         "ips": {current_user: "10.77.0.1"},
                         "room_key": str(uuid.uuid4()),
                         "next_ip": 2
                     }
-                    await websocket.send_text(json.dumps({
+                    await websocket.send_json({
                         "type": "room_created",
                         "room": {
                             "room_id": room_id,
@@ -306,42 +270,30 @@ async def websocket_endpoint(websocket: WebSocket):
                             "room_key": rooms[room_id]["room_key"],
                             "subnet": "10.77.0.0"
                         }
-                    }))
+                    })
                     await broadcast_room_list()
                     continue
 
-                # ========== JOIN ROOM ==========
+                # ---------- JOIN ROOM ----------
                 if msg_type == "join_room":
                     room_id = msg.get("room_id")
                     password = msg.get("password", "")
                     if room_id not in rooms:
-                        await websocket.send_text(json.dumps({
-                            "type": "room_joined",
-                            "success": False,
-                            "message": "Room not found"
-                        }))
+                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Room not found"})
                         continue
                     room = rooms[room_id]
                     if room.get("password") and room["password"] != password:
-                        await websocket.send_text(json.dumps({
-                            "type": "room_joined",
-                            "success": False,
-                            "message": "Wrong password"
-                        }))
+                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Wrong password"})
                         continue
                     if len(room["players"]) >= room["max_players"]:
-                        await websocket.send_text(json.dumps({
-                            "type": "room_joined",
-                            "success": False,
-                            "message": "Room full"
-                        }))
+                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Room full"})
                         continue
                     if current_user not in room["players"]:
                         room["players"].append(current_user)
                         ip_idx = room.get("next_ip", len(room["players"]) + 1)
                         room["ips"][current_user] = f"10.77.0.{ip_idx}"
                         room["next_ip"] = ip_idx + 1
-                    await websocket.send_text(json.dumps({
+                    await websocket.send_json({
                         "type": "room_joined",
                         "room": {
                             "room_id": room_id,
@@ -352,12 +304,11 @@ async def websocket_endpoint(websocket: WebSocket):
                             "ips": room["ips"],
                             "host": room["host"]
                         }
-                    }))
-                    # Broadcast room players to all
+                    })
                     await broadcast_room_players(room_id)
                     continue
 
-                # ========== LEAVE ROOM ==========
+                # ---------- LEAVE ROOM ----------
                 if msg_type == "leave_room":
                     for rid, room in list(rooms.items()):
                         if current_user in room["players"]:
@@ -369,68 +320,56 @@ async def websocket_endpoint(websocket: WebSocket):
                             else:
                                 await broadcast_room_players(rid)
                             break
-                    await websocket.send_text(json.dumps({
-                        "type": "left_room",
-                        "success": True
-                    }))
+                    await websocket.send_json({"type": "left_room", "success": True})
                     continue
 
-                # ========== OFFER ==========
+                # ---------- OFFER ----------
                 if msg_type == "offer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
                     game = msg.get("game_name", "")
                     public_key = msg.get("public_key", "")
                     if target and target in connected_users and sdp:
-                        await connected_users[target].send_text(json.dumps({
+                        await connected_users[target].send_json({
                             "type": "offer_received",
                             "from": current_user,
                             "sdp": sdp,
                             "game_name": game,
                             "public_key": public_key
-                        }))
+                        })
                     continue
 
-                # ========== ANSWER ==========
+                # ---------- ANSWER ----------
                 if msg_type == "answer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
                     if target and target in connected_users and sdp:
-                        await connected_users[target].send_text(json.dumps({
+                        await connected_users[target].send_json({
                             "type": "answer_received",
                             "from": current_user,
                             "sdp": sdp
-                        }))
+                        })
                     continue
 
-                # ========== ICE CANDIDATE ==========
+                # ---------- ICE ----------
                 if msg_type == "ice_candidate":
                     target = msg.get("target")
                     candidate = msg.get("candidate")
                     if target and target in connected_users and candidate:
-                        await connected_users[target].send_text(json.dumps({
+                        await connected_users[target].send_json({
                             "type": "ice_candidate_received",
                             "from": current_user,
                             "candidate": candidate
-                        }))
+                        })
                     continue
 
-                # ========== UNKNOWN ==========
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": f"Unknown message type: {msg_type}"
-                }))
+                # ---------- UNKNOWN ----------
+                await websocket.send_json({"type": "error", "message": f"Unknown type: {msg_type}"})
 
             except json.JSONDecodeError:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": "Invalid JSON"
-                }))
+                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
             except Exception as e:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": str(e)
-                }))
+                await websocket.send_json({"type": "error", "message": str(e)})
 
     except WebSocketDisconnect:
         pass
@@ -454,7 +393,7 @@ async def broadcast(data, exclude=None):
     for name, ws in list(connected_users.items()):
         if name != exclude:
             try:
-                await ws.send_text(json.dumps(data))
+                await ws.send_json(data)
             except:
                 pass
 
