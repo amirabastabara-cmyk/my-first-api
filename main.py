@@ -1,19 +1,18 @@
-# main.py - VoidVision Server (Pure Python, no compilation)
+# main.py - VoidVision Server (Simplified & Compatible)
 import os
 import json
 import uuid
-import bcrypt
-import jwt
 import hashlib
+import jwt
+import bcrypt
 from datetime import datetime, timedelta
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 app = FastAPI(title="VoidVision Server")
 
-# CORS
+# CORS - اجازه دسترسی از همه جا
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,9 +24,8 @@ app.add_middleware(
 # ================== Config ==================
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-on-render")
 JWT_ALGORITHM = "HS256"
-TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 BCRYPT_ROUNDS = 12
-security = HTTPBearer()
 
 # ================== Models ==================
 class UserRegister(BaseModel):
@@ -38,18 +36,12 @@ class UserLogin(BaseModel):
     username: str
     password: str
 
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    username: str
-    user_id: str
-
 # ================== Database ==================
-users_db = {}
-online_users = {}
-rooms = {}
-friend_requests = {}
-friends = {}
+users_db = {}          # username -> {"password_hash": str, "user_id": str}
+online_users = {}      # username -> websocket
+rooms = {}             # room_id -> dict
+friends = {}           # username -> [friend_username]
+friend_requests = {}   # username -> [from_user]
 
 # ================== Helper Functions ==================
 def create_token(username: str, user_id: str) -> str:
@@ -68,15 +60,6 @@ def verify_token(token: str) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    payload = verify_token(token)
-    username = payload.get("sub")
-    user_id = payload.get("user_id")
-    if username not in users_db or users_db[username]["user_id"] != user_id:
-        raise HTTPException(status_code=401, detail="Invalid user")
-    return {"username": username, "user_id": user_id}
-
 # ================== REST API ==================
 @app.post("/api/register")
 async def register(user: UserRegister):
@@ -93,7 +76,7 @@ async def register(user: UserRegister):
     friend_requests[username] = []
     return {"success": True, "message": "Registered successfully"}
 
-@app.post("/api/login", response_model=TokenResponse)
+@app.post("/api/login")
 async def login(user: UserLogin):
     username = user.username.strip()
     password = user.password.strip()
@@ -103,11 +86,12 @@ async def login(user: UserLogin):
     if not bcrypt.checkpw(password.encode(), stored["password_hash"].encode()):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token(username, stored["user_id"])
-    return TokenResponse(access_token=token, username=username, user_id=stored["user_id"])
-
-@app.get("/api/verify")
-async def verify(current_user: dict = Depends(get_current_user)):
-    return {"valid": True, "username": current_user["username"], "user_id": current_user["user_id"]}
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "username": username,
+        "user_id": stored["user_id"]
+    }
 
 # ================== WebSocket ==================
 class ConnectionManager:
@@ -154,7 +138,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 msg = json.loads(raw)
                 t = msg.get("type")
 
-                # ---------- AUTH ----------
+                # ========== AUTH ==========
                 if t == "auth":
                     token = msg.get("token")
                     if not token:
@@ -191,11 +175,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_json({"type": "auth_response", "success": False, "message": str(e)})
                     continue
 
+                # ========== چک احراز هویت ==========
                 if not current_user:
                     await websocket.send_json({"type": "error", "message": "Not authenticated"})
                     continue
 
-                # ---------- ROOM ----------
+                # ========== ROOM LIST ==========
                 if t == "get_room_list":
                     room_list = []
                     for rid, r in rooms.items():
@@ -208,6 +193,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
                     await websocket.send_json({"type": "room_list", "rooms": room_list})
 
+                # ========== CREATE ROOM ==========
                 elif t == "create_room":
                     room_id = str(uuid.uuid4())[:6]
                     rooms[room_id] = {
@@ -231,6 +217,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     await manager.broadcast({"type": "room_list", "rooms": []})
 
+                # ========== JOIN ROOM ==========
                 elif t == "join_room":
                     room_id = msg.get("room_id")
                     pwd = msg.get("password", "")
@@ -270,6 +257,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "room_key": room["room_key"]
                     })
 
+                # ========== LEAVE ROOM ==========
                 elif t == "leave_room":
                     for rid, room in list(rooms.items()):
                         if current_user in room["players"]:
@@ -290,7 +278,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             break
                     await websocket.send_json({"type": "left_room", "success": True})
 
-                # ---------- SIGNALING ----------
+                # ========== OFFER (WebRTC) ==========
                 elif t == "offer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
@@ -305,6 +293,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "public_key": public_key
                         })
 
+                # ========== ANSWER ==========
                 elif t == "answer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
@@ -315,6 +304,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "sdp": sdp
                         })
 
+                # ========== ICE CANDIDATE ==========
                 elif t == "ice_candidate":
                     target = msg.get("target")
                     cand = msg.get("candidate")
@@ -325,7 +315,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "candidate": cand
                         })
 
-                # ---------- CHAT ----------
+                # ========== CHAT ==========
                 elif t == "chat_message":
                     text = msg.get("message", "")[:500]
                     if current_user and text:
@@ -335,7 +325,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "message": text
                         })
 
-                # ---------- FRIENDS ----------
+                # ========== FRIENDS ==========
                 elif t == "friend_request":
                     target = msg.get("target")
                     if target and target in users_db:
@@ -373,7 +363,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     if target and target in friend_requests.get(current_user, []):
                         friend_requests[current_user].remove(target)
 
-                # ---------- READY & LAUNCH ----------
+                # ========== READY & LAUNCH ==========
                 elif t == "ready_to_launch":
                     await manager.broadcast({
                         "type": "player_ready",
