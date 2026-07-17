@@ -1,17 +1,17 @@
-# main.py - VoidVision Signaling Server (No Wintun)
+# main.py - VoidVision Server (REST Auth + WebSocket Signaling)
 import os
 import json
 import uuid
 import bcrypt
 import jwt
-import time
 import hashlib
 from datetime import datetime, timedelta
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-app = FastAPI(title="VoidVision Signaling Server")
+app = FastAPI(title="VoidVision Server")
 
 # CORS
 app.add_middleware(
@@ -27,6 +27,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-on-render")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 BCRYPT_ROUNDS = 12
+security = HTTPBearer()
 
 # ================== Models ==================
 class UserRegister(BaseModel):
@@ -37,22 +38,46 @@ class UserLogin(BaseModel):
     username: str
     password: str
 
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+    user_id: str
+
 # ================== Database (in-memory) ==================
-users_db = {}
-online_users = {}
-rooms = {}
-friend_requests = {}
-friends = {}
+users_db = {}          # username -> {"password_hash": str, "user_id": str}
+online_users = {}      # username -> websocket
+rooms = {}             # room_id -> dict
+friend_requests = {}   # username -> [from_user]
+friends = {}           # username -> [friend_username]
 
-# ================== Helper ==================
-def get_room_subnet(room_id: str) -> str:
-    if not room_id:
-        return "10.77.10.0"
-    hash_hex = hashlib.sha256(room_id.encode()).hexdigest()
-    num = int(hash_hex[:8], 16) % 240 + 10
-    return f"10.77.{num}.0"
+# ================== Helper Functions ==================
+def create_token(username: str, user_id: str) -> str:
+    payload = {
+        "sub": username,
+        "user_id": user_id,
+        "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-# ================== REST API ==================
+def verify_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    payload = verify_token(token)
+    username = payload.get("sub")
+    user_id = payload.get("user_id")
+    if username not in users_db or users_db[username]["user_id"] != user_id:
+        raise HTTPException(status_code=401, detail="Invalid user")
+    return {"username": username, "user_id": user_id}
+
+# ================== REST API (Login/Register) ==================
 @app.post("/api/register")
 async def register(user: UserRegister):
     username = user.username.strip()
@@ -68,7 +93,7 @@ async def register(user: UserRegister):
     friend_requests[username] = []
     return {"success": True, "message": "Registered successfully"}
 
-@app.post("/api/login")
+@app.post("/api/login", response_model=TokenResponse)
 async def login(user: UserLogin):
     username = user.username.strip()
     password = user.password.strip()
@@ -77,15 +102,14 @@ async def login(user: UserLogin):
     stored = users_db[username]
     if not bcrypt.checkpw(password.encode(), stored["password_hash"].encode()):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    payload = {
-        "sub": username,
-        "user_id": stored["user_id"],
-        "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
-    }
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return {"access_token": token, "token_type": "bearer", "username": username, "user_id": stored["user_id"]}
+    token = create_token(username, stored["user_id"])
+    return TokenResponse(access_token=token, username=username, user_id=stored["user_id"])
 
-# ================== WebSocket ==================
+@app.get("/api/verify")
+async def verify(current_user: dict = Depends(get_current_user)):
+    return {"valid": True, "username": current_user["username"], "user_id": current_user["user_id"]}
+
+# ================== WebSocket Signaling ==================
 class ConnectionManager:
     def __init__(self):
         self.active_connections = []
@@ -120,7 +144,9 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, token: str = None):
+    # ابتدا توکن را از query string دریافت می‌کنیم
+    # یا می‌توانیم بعد از اتصال، پیام auth دریافت کنیم
     await websocket.accept()
     current_user = None
     try:
@@ -130,14 +156,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 msg = json.loads(raw)
                 t = msg.get("type")
 
-                # ========== AUTH ==========
+                # ---------- AUTH (اولین پیام باید auth باشد) ----------
                 if t == "auth":
                     token = msg.get("token")
                     if not token:
                         await websocket.send_json({"type": "auth_response", "success": False, "message": "No token"})
                         continue
                     try:
-                        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+                        payload = verify_token(token)
                         username = payload["sub"]
                         user_id = payload["user_id"]
                         if username not in users_db or users_db[username]["user_id"] != user_id:
@@ -167,71 +193,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_json({"type": "auth_response", "success": False, "message": str(e)})
                     continue
 
-                # ========== REGISTER (بدون احراز هویت) ==========
-                if t == "register":
-                    username = msg.get("username", "").strip()
-                    password = msg.get("password", "").strip()
-                    if not username or len(password) < 4:
-                        await websocket.send_json({"type": "register_response", "success": False, "message": "Invalid"})
-                        continue
-                    if username in users_db:
-                        await websocket.send_json({"type": "register_response", "success": False, "message": "Exists"})
-                        continue
-                    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(BCRYPT_ROUNDS)).decode()
-                    user_id = str(uuid.uuid4())
-                    users_db[username] = {"password_hash": password_hash, "user_id": user_id}
-                    friends[username] = []
-                    friend_requests[username] = []
-                    await websocket.send_json({"type": "register_response", "success": True, "message": "Registered"})
-                    continue
-
-                # ========== LOGIN (بدون احراز هویت) ==========
-                if t == "login":
-                    username = msg.get("username", "").strip()
-                    password = msg.get("password", "").strip()
-                    if username not in users_db:
-                        await websocket.send_json({"type": "login_response", "success": False, "message": "Invalid"})
-                        continue
-                    stored = users_db[username]
-                    if not bcrypt.checkpw(password.encode(), stored["password_hash"].encode()):
-                        await websocket.send_json({"type": "login_response", "success": False, "message": "Invalid"})
-                        continue
-                    payload = {
-                        "sub": username,
-                        "user_id": stored["user_id"],
-                        "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
-                    }
-                    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-                    if username in online_users:
-                        old = online_users[username]
-                        if old != websocket:
-                            await old.close(code=1000, reason="Duplicate login")
-                    await manager.connect(websocket, username)
-                    current_user = username
-                    await websocket.send_json({
-                        "type": "login_response",
-                        "success": True,
-                        "username": username,
-                        "user_id": stored["user_id"],
-                        "token": token
-                    })
-                    await manager.broadcast({"type": "user_list", "users": list(online_users.keys())})
-                    await websocket.send_json({
-                        "type": "friend_requests_list",
-                        "requests": friend_requests.get(username, [])
-                    })
-                    await websocket.send_json({
-                        "type": "friends_list",
-                        "friends": friends.get(username, [])
-                    })
-                    continue
-
-                # ========== چک کردن احراز هویت ==========
+                # اگر احراز هویت نشده باشد
                 if not current_user:
                     await websocket.send_json({"type": "error", "message": "Not authenticated"})
                     continue
 
-                # ========== ROOM LIST ==========
+                # ---------- ROOM LIST ----------
                 if t == "get_room_list":
                     room_list = []
                     for rid, r in rooms.items():
@@ -244,7 +211,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
                     await websocket.send_json({"type": "room_list", "rooms": room_list})
 
-                # ========== CREATE ROOM ==========
+                # ---------- CREATE ROOM ----------
                 elif t == "create_room":
                     room_id = str(uuid.uuid4())[:6]
                     rooms[room_id] = {
@@ -268,7 +235,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     await manager.broadcast({"type": "room_list", "rooms": []})
 
-                # ========== JOIN ROOM ==========
+                # ---------- JOIN ROOM ----------
                 elif t == "join_room":
                     room_id = msg.get("room_id")
                     pwd = msg.get("password", "")
@@ -308,7 +275,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "room_key": room["room_key"]
                     })
 
-                # ========== LEAVE ROOM ==========
+                # ---------- LEAVE ROOM ----------
                 elif t == "leave_room":
                     for rid, room in list(rooms.items()):
                         if current_user in room["players"]:
@@ -329,7 +296,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             break
                     await websocket.send_json({"type": "left_room", "success": True})
 
-                # ========== OFFER ==========
+                # ---------- OFFER (WebRTC) ----------
                 elif t == "offer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
@@ -344,7 +311,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "public_key": public_key
                         })
 
-                # ========== ANSWER ==========
+                # ---------- ANSWER ----------
                 elif t == "answer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
@@ -355,7 +322,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "sdp": sdp
                         })
 
-                # ========== ICE ==========
+                # ---------- ICE ----------
                 elif t == "ice_candidate":
                     target = msg.get("target")
                     cand = msg.get("candidate")
@@ -366,7 +333,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "candidate": cand
                         })
 
-                # ========== CHAT ==========
+                # ---------- CHAT ----------
                 elif t == "chat_message":
                     text = msg.get("message", "")[:500]
                     if current_user and text:
@@ -376,7 +343,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "message": text
                         })
 
-                # ========== FRIENDS ==========
+                # ---------- FRIENDS ----------
                 elif t == "friend_request":
                     target = msg.get("target")
                     if target and target in users_db:
@@ -414,7 +381,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     if target and target in friend_requests.get(current_user, []):
                         friend_requests[current_user].remove(target)
 
-                # ========== READY & LAUNCH ==========
+                # ---------- READY & LAUNCH ----------
                 elif t == "ready_to_launch":
                     await manager.broadcast({
                         "type": "player_ready",
