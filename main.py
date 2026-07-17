@@ -1,16 +1,23 @@
-# server.py - سبک و سریع برای VPS با رم کم
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+VoidVision Server v26.0.0 - Lightweight for VPS 512MB
+"""
+
 import json
 import uuid
 import bcrypt
 import jwt
 import os
 import time
+import asyncio
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="VoidVision Signaling Server (Light)")
+app = FastAPI(title="VoidVision Server")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +31,7 @@ app.add_middleware(
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-in-production")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
-BCRYPT_ROUNDS = 12
+BCRYPT_ROUNDS = 10  # کاهش برای VPS ضعیف
 
 # ================== Models ==================
 class UserRegister(BaseModel):
@@ -48,15 +55,15 @@ async def register(user: UserRegister):
     username = user.username.strip()
     password = user.password.strip()
     if not username or len(password) < 6:
-        return {"success": False, "message": "Username and password (min 6 chars) required"}
+        return {"success": False, "message": "Invalid credentials"}
     if username in users_db:
-        return {"success": False, "message": "Username already exists"}
+        return {"success": False, "message": "Username exists"}
     password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(BCRYPT_ROUNDS)).decode()
     user_id = str(uuid.uuid4())
     users_db[username] = {"password_hash": password_hash, "user_id": user_id}
     friends[username] = []
     friend_requests[username] = []
-    return {"success": True, "message": "Registered successfully"}
+    return {"success": True, "message": "Registered"}
 
 @app.post("/api/login")
 async def login(user: UserLogin):
@@ -75,7 +82,7 @@ async def login(user: UserLogin):
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return {"access_token": token, "token_type": "bearer", "username": username, "user_id": stored["user_id"]}
 
-# ================== WebSocket (Signaling) ==================
+# ================== WebSocket Signaling ==================
 class ConnectionManager:
     def __init__(self):
         self.active_connections = []
@@ -97,10 +104,13 @@ class ConnectionManager:
     async def send_to_user(self, username: str, data: dict):
         ws = online_users.get(username)
         if ws:
-            await ws.send_json(data)
+            try:
+                await ws.send_json(data)
+            except:
+                pass
 
     async def broadcast(self, data: dict, exclude=None):
-        for conn in self.active_connections:
+        for conn in self.active_connections[:]:
             if conn != exclude:
                 try:
                     await conn.send_json(data)
@@ -115,7 +125,16 @@ async def websocket_endpoint(websocket: WebSocket):
     current_user = None
     try:
         while True:
-            raw = await websocket.receive_text()
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=60)
+            except asyncio.TimeoutError:
+                # Heartbeat timeout
+                if current_user:
+                    await manager.send_to_user(current_user, {"type": "ping"})
+                continue
+            except Exception:
+                break
+
             try:
                 msg = json.loads(raw)
                 t = msg.get("type")
@@ -135,7 +154,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         if username in online_users:
                             old = online_users[username]
                             if old != websocket:
-                                await old.close(code=1000, reason="Duplicate login")
+                                try:
+                                    await old.close(code=1000, reason="Duplicate login")
+                                except:
+                                    pass
                         await manager.connect(websocket, username)
                         current_user = username
                         await websocket.send_json({
@@ -144,9 +166,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "username": username,
                             "user_id": user_id
                         })
-                        # ارسال لیست کاربران آنلاین
                         await manager.broadcast({"type": "user_list", "users": list(online_users.keys())})
-                        # ارسال دوستان و درخواست‌ها
                         await websocket.send_json({
                             "type": "friend_requests_list",
                             "requests": friend_requests.get(username, [])
@@ -163,30 +183,32 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "error", "message": "Not authenticated"})
                     continue
 
-                # ---------- ROOM LIST ----------
+                # ---------- ROOM ----------
                 if t == "get_room_list":
                     room_list = []
                     for rid, r in rooms.items():
                         room_list.append({
                             "room_id": rid,
-                            "room_name": r["name"],
+                            "room_name": r["name"][:30],
                             "has_password": bool(r.get("password")),
                             "count": len(r["players"]),
                             "max": r["max_players"]
                         })
                     await websocket.send_json({"type": "room_list", "rooms": room_list})
 
-                # ---------- CREATE ROOM ----------
                 elif t == "create_room":
                     room_id = str(uuid.uuid4())[:6]
                     rooms[room_id] = {
-                        "name": msg.get("room_name", "Room"),
+                        "name": msg.get("room_name", "Room")[:30],
                         "password": msg.get("password", ""),
-                        "max_players": msg.get("max_players", 8),
+                        "max_players": min(msg.get("max_players", 6), 8),
                         "host": current_user,
                         "players": [current_user],
-                        "room_key": str(uuid.uuid4())
+                        "room_key": str(uuid.uuid4()),
+                        "next_ip": 2,
+                        "created": time.time()
                     }
+                    ips = {current_user: "10.77.0.1"}
                     await websocket.send_json({
                         "type": "room_created",
                         "room": {
@@ -196,25 +218,27 @@ async def websocket_endpoint(websocket: WebSocket):
                             "subnet": "10.77.0."
                         }
                     })
-                    # ارسال لیست جدید روم‌ها به همه
-                    await manager.broadcast({"type": "room_list", "rooms": []})  # ساده‌سازی
+                    # Broadcast updated room list
+                    await manager.broadcast({"type": "room_list", "rooms": []})
 
-                # ---------- JOIN ROOM ----------
                 elif t == "join_room":
                     room_id = msg.get("room_id")
                     pwd = msg.get("password", "")
                     if room_id not in rooms:
-                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Room not found"})
+                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Not found"})
                         continue
                     room = rooms[room_id]
                     if room.get("password") and room["password"] != pwd:
                         await websocket.send_json({"type": "room_joined", "success": False, "message": "Wrong password"})
                         continue
                     if len(room["players"]) >= room["max_players"]:
-                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Room full"})
+                        await websocket.send_json({"type": "room_joined", "success": False, "message": "Full"})
                         continue
                     if current_user not in room["players"]:
                         room["players"].append(current_user)
+                        ip_idx = room.get("next_ip", len(room["players"]) + 1)
+                        room["next_ip"] = ip_idx + 1
+                    ips = {p: f"10.77.0.{i+1}" for i, p in enumerate(room["players"])}
                     await websocket.send_json({
                         "type": "room_joined",
                         "room": {
@@ -224,8 +248,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             "subnet": "10.77.0."
                         }
                     })
-                    # ارسال لیست بازیکنان
-                    ips = {p: f"10.77.0.{i+1}" for i, p in enumerate(room["players"])}
                     await manager.broadcast({
                         "type": "room_players",
                         "players": room["players"],
@@ -235,7 +257,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         "room_key": room["room_key"]
                     })
 
-                # ---------- LEAVE ROOM ----------
                 elif t == "leave_room":
                     for rid, room in list(rooms.items()):
                         if current_user in room["players"]:
@@ -256,19 +277,19 @@ async def websocket_endpoint(websocket: WebSocket):
                             break
                     await websocket.send_json({"type": "left_room", "success": True})
 
-                # ---------- OFFER / ANSWER / ICE (Signaling) ----------
+                # ---------- SIGNALING ----------
                 elif t == "offer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
                     game = msg.get("game_name", "")
-                    salt = msg.get("salt", "")  # برای Crypto
+                    public_key = msg.get("public_key", "")
                     if target and sdp:
                         await manager.send_to_user(target, {
                             "type": "offer_received",
                             "from": current_user,
                             "sdp": sdp,
                             "game_name": game,
-                            "salt": salt
+                            "public_key": public_key
                         })
 
                 elif t == "answer":
@@ -304,7 +325,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # ---------- FRIENDS ----------
                 elif t == "friend_request":
                     target = msg.get("target")
-                    if target and target in users_db:
+                    if target and target in users_db and target != current_user:
                         if target not in friend_requests.get(target, []):
                             friend_requests.setdefault(target, []).append(current_user)
                             await manager.send_to_user(target, {
@@ -359,16 +380,20 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
 
                 else:
-                    await websocket.send_json({"type": "error", "message": f"Unknown type: {t}"})
+                    await websocket.send_json({"type": "error", "message": f"Unknown: {t}"})
 
             except json.JSONDecodeError:
                 await websocket.send_json({"type": "error", "message": "Invalid JSON"})
+            except Exception as e:
+                await websocket.send_json({"type": "error", "message": str(e)})
 
     except WebSocketDisconnect:
+        pass
+    finally:
         manager.disconnect(websocket)
         if current_user:
             await manager.broadcast({"type": "user_list", "users": list(online_users.keys())})
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
