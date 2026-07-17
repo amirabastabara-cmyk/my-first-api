@@ -1,4 +1,4 @@
-# main.py - VoidVision Server (REST Auth + WebSocket Signaling)
+# main.py - VoidVision Server (با Pydantic V2)
 import os
 import json
 import uuid
@@ -29,7 +29,7 @@ TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 BCRYPT_ROUNDS = 12
 security = HTTPBearer()
 
-# ================== Models ==================
+# ================== Models (Pydantic V2) ==================
 class UserRegister(BaseModel):
     username: str
     password: str
@@ -144,9 +144,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: str = None):
-    # ابتدا توکن را از query string دریافت می‌کنیم
-    # یا می‌توانیم بعد از اتصال، پیام auth دریافت کنیم
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     current_user = None
     try:
@@ -156,7 +154,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None):
                 msg = json.loads(raw)
                 t = msg.get("type")
 
-                # ---------- AUTH (اولین پیام باید auth باشد) ----------
+                # ---------- AUTH ----------
                 if t == "auth":
                     token = msg.get("token")
                     if not token:
