@@ -2,9 +2,9 @@ services:
   - type: web
     name: voidvision-server
     runtime: python
-    buildCommand: ""
-    startCommand: python server.py
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
     plan: free
     envVars:
-      - key: PORT
-        value: 10000
+      - key: JWT_SECRET
+        generateValue: true
