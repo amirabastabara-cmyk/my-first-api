@@ -1,24 +1,18 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-VoidVision Server v26.0.0 - Lightweight for VPS 512MB
-"""
-
+# main.py - سرور VoidVision برای Render
+import os
 import json
 import uuid
 import bcrypt
 import jwt
-import os
 import time
-import asyncio
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="VoidVision Server")
+app = FastAPI(title="VoidVision Signaling Server")
 
+# CORS برای دسترسی از همه جا
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,10 +22,10 @@ app.add_middleware(
 )
 
 # ================== Config ==================
-JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-in-production")
+JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-on-render")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
-BCRYPT_ROUNDS = 10  # کاهش برای VPS ضعیف
+BCRYPT_ROUNDS = 12
 
 # ================== Models ==================
 class UserRegister(BaseModel):
@@ -43,6 +37,7 @@ class UserLogin(BaseModel):
     password: str
 
 # ================== Database (in-memory) ==================
+# برای Render Free Tier حافظه موقت کافی است
 users_db = {}          # username -> {"password_hash": str, "user_id": str}
 online_users = {}      # username -> websocket
 rooms = {}             # room_id -> dict
@@ -55,15 +50,15 @@ async def register(user: UserRegister):
     username = user.username.strip()
     password = user.password.strip()
     if not username or len(password) < 6:
-        return {"success": False, "message": "Invalid credentials"}
+        return {"success": False, "message": "Username and password (min 6 chars) required"}
     if username in users_db:
-        return {"success": False, "message": "Username exists"}
+        return {"success": False, "message": "Username already exists"}
     password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(BCRYPT_ROUNDS)).decode()
     user_id = str(uuid.uuid4())
     users_db[username] = {"password_hash": password_hash, "user_id": user_id}
     friends[username] = []
     friend_requests[username] = []
-    return {"success": True, "message": "Registered"}
+    return {"success": True, "message": "Registered successfully"}
 
 @app.post("/api/login")
 async def login(user: UserLogin):
@@ -104,13 +99,10 @@ class ConnectionManager:
     async def send_to_user(self, username: str, data: dict):
         ws = online_users.get(username)
         if ws:
-            try:
-                await ws.send_json(data)
-            except:
-                pass
+            await ws.send_json(data)
 
     async def broadcast(self, data: dict, exclude=None):
-        for conn in self.active_connections[:]:
+        for conn in self.active_connections:
             if conn != exclude:
                 try:
                     await conn.send_json(data)
@@ -125,16 +117,7 @@ async def websocket_endpoint(websocket: WebSocket):
     current_user = None
     try:
         while True:
-            try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=60)
-            except asyncio.TimeoutError:
-                # Heartbeat timeout
-                if current_user:
-                    await manager.send_to_user(current_user, {"type": "ping"})
-                continue
-            except Exception:
-                break
-
+            raw = await websocket.receive_text()
             try:
                 msg = json.loads(raw)
                 t = msg.get("type")
@@ -154,10 +137,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         if username in online_users:
                             old = online_users[username]
                             if old != websocket:
-                                try:
-                                    await old.close(code=1000, reason="Duplicate login")
-                                except:
-                                    pass
+                                await old.close(code=1000, reason="Duplicate login")
                         await manager.connect(websocket, username)
                         current_user = username
                         await websocket.send_json({
@@ -189,7 +169,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     for rid, r in rooms.items():
                         room_list.append({
                             "room_id": rid,
-                            "room_name": r["name"][:30],
+                            "room_name": r["name"],
                             "has_password": bool(r.get("password")),
                             "count": len(r["players"]),
                             "max": r["max_players"]
@@ -199,27 +179,26 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif t == "create_room":
                     room_id = str(uuid.uuid4())[:6]
                     rooms[room_id] = {
-                        "name": msg.get("room_name", "Room")[:30],
+                        "name": msg.get("room_name", "Room"),
                         "password": msg.get("password", ""),
-                        "max_players": min(msg.get("max_players", 6), 8),
+                        "max_players": msg.get("max_players", 8),
                         "host": current_user,
                         "players": [current_user],
                         "room_key": str(uuid.uuid4()),
-                        "next_ip": 2,
-                        "created": time.time()
+                        "ips": {current_user: "10.77.0.1"},  # IP allocation
+                        "next_ip": 2
                     }
-                    ips = {current_user: "10.77.0.1"}
                     await websocket.send_json({
                         "type": "room_created",
                         "room": {
                             "room_id": room_id,
                             "room_name": rooms[room_id]["name"],
                             "room_key": rooms[room_id]["room_key"],
-                            "subnet": "10.77.0."
+                            "subnet": "10.77.0.0"  # Fixed subnet
                         }
                     })
                     # Broadcast updated room list
-                    await manager.broadcast({"type": "room_list", "rooms": []})
+                    await manager.broadcast({"type": "room_list", "rooms": []})  # Simplified
 
                 elif t == "join_room":
                     room_id = msg.get("room_id")
@@ -236,24 +215,30 @@ async def websocket_endpoint(websocket: WebSocket):
                         continue
                     if current_user not in room["players"]:
                         room["players"].append(current_user)
+                        # Assign next available IP
                         ip_idx = room.get("next_ip", len(room["players"]) + 1)
+                        room["ips"][current_user] = f"10.77.0.{ip_idx}"
                         room["next_ip"] = ip_idx + 1
-                    ips = {p: f"10.77.0.{i+1}" for i, p in enumerate(room["players"])}
+                    # Send join confirmation with all data
                     await websocket.send_json({
                         "type": "room_joined",
                         "room": {
                             "room_id": room_id,
                             "room_name": room["name"],
                             "room_key": room["room_key"],
-                            "subnet": "10.77.0."
+                            "subnet": "10.77.0.0",
+                            "players": room["players"],
+                            "ips": room["ips"],
+                            "host": room["host"]
                         }
                     })
+                    # Broadcast player list to all room members
                     await manager.broadcast({
                         "type": "room_players",
                         "players": room["players"],
-                        "ips": ips,
+                        "ips": room["ips"],
                         "host": room["host"],
-                        "subnet": "10.77.0.",
+                        "subnet": "10.77.0.0",
                         "room_key": room["room_key"]
                     })
 
@@ -261,17 +246,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     for rid, room in list(rooms.items()):
                         if current_user in room["players"]:
                             room["players"].remove(current_user)
+                            room["ips"].pop(current_user, None)
                             if room["host"] == current_user or not room["players"]:
                                 del rooms[rid]
                                 await manager.broadcast({"type": "room_closed", "room_id": rid})
                             else:
-                                ips = {p: f"10.77.0.{i+1}" for i, p in enumerate(room["players"])}
                                 await manager.broadcast({
                                     "type": "room_players",
                                     "players": room["players"],
-                                    "ips": ips,
+                                    "ips": room["ips"],
                                     "host": room["host"],
-                                    "subnet": "10.77.0.",
+                                    "subnet": "10.77.0.0",
                                     "room_key": room["room_key"]
                                 })
                             break
@@ -325,7 +310,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # ---------- FRIENDS ----------
                 elif t == "friend_request":
                     target = msg.get("target")
-                    if target and target in users_db and target != current_user:
+                    if target and target in users_db:
                         if target not in friend_requests.get(target, []):
                             friend_requests.setdefault(target, []).append(current_user)
                             await manager.send_to_user(target, {
@@ -379,21 +364,29 @@ async def websocket_endpoint(websocket: WebSocket):
                             "room_id": room_id
                         })
 
+                elif t == "invite":
+                    target = msg.get("target")
+                    room_id = msg.get("room_id")
+                    if target and room_id:
+                        await manager.send_to_user(target, {
+                            "type": "game_invite",
+                            "from": current_user,
+                            "room_id": room_id
+                        })
+
                 else:
-                    await websocket.send_json({"type": "error", "message": f"Unknown: {t}"})
+                    await websocket.send_json({"type": "error", "message": f"Unknown type: {t}"})
 
             except json.JSONDecodeError:
                 await websocket.send_json({"type": "error", "message": "Invalid JSON"})
-            except Exception as e:
-                await websocket.send_json({"type": "error", "message": str(e)})
 
     except WebSocketDisconnect:
-        pass
-    finally:
         manager.disconnect(websocket)
         if current_user:
             await manager.broadcast({"type": "user_list", "users": list(online_users.keys())})
 
+# ================== ENTRY ==================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+    port = int(os.environ.get("PORT", 8000))  # Render uses PORT env variable
+    uvicorn.run(app, host="0.0.0.0", port=port)
