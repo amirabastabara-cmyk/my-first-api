@@ -1,4 +1,4 @@
-# main.py - VoidVision Signaling Server (Fixed)
+# main.py - VoidVision Signaling Server (No Wintun)
 import os
 import json
 import uuid
@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 app = FastAPI(title="VoidVision Signaling Server")
 
-# CORS برای دسترسی از همه جا
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,7 +25,7 @@ app.add_middleware(
 # ================== Config ==================
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-on-render")
 JWT_ALGORITHM = "HS256"
-TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 BCRYPT_ROUNDS = 12
 
 # ================== Models ==================
@@ -38,13 +38,13 @@ class UserLogin(BaseModel):
     password: str
 
 # ================== Database (in-memory) ==================
-users_db = {}          # username -> {"password_hash": str, "user_id": str}
-online_users = {}      # username -> websocket
-rooms = {}             # room_id -> dict
-friend_requests = {}   # username -> [from_user]
-friends = {}           # username -> [friend_username]
+users_db = {}
+online_users = {}
+rooms = {}
+friend_requests = {}
+friends = {}
 
-# ================== Helper Functions ==================
+# ================== Helper ==================
 def get_room_subnet(room_id: str) -> str:
     if not room_id:
         return "10.77.10.0"
@@ -85,7 +85,7 @@ async def login(user: UserLogin):
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return {"access_token": token, "token_type": "bearer", "username": username, "user_id": stored["user_id"]}
 
-# ================== WebSocket Signaling ==================
+# ================== WebSocket ==================
 class ConnectionManager:
     def __init__(self):
         self.active_connections = []
@@ -130,7 +130,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 msg = json.loads(raw)
                 t = msg.get("type")
 
-                # ========== AUTH (بدون احراز هویت قبلی) ==========
+                # ========== AUTH ==========
                 if t == "auth":
                     token = msg.get("token")
                     if not token:
@@ -172,17 +172,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     username = msg.get("username", "").strip()
                     password = msg.get("password", "").strip()
                     if not username or len(password) < 4:
-                        await websocket.send_json({"type": "register_response", "success": False, "message": "Invalid credentials"})
+                        await websocket.send_json({"type": "register_response", "success": False, "message": "Invalid"})
                         continue
                     if username in users_db:
-                        await websocket.send_json({"type": "register_response", "success": False, "message": "Username already exists"})
+                        await websocket.send_json({"type": "register_response", "success": False, "message": "Exists"})
                         continue
                     password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(BCRYPT_ROUNDS)).decode()
                     user_id = str(uuid.uuid4())
                     users_db[username] = {"password_hash": password_hash, "user_id": user_id}
                     friends[username] = []
                     friend_requests[username] = []
-                    await websocket.send_json({"type": "register_response", "success": True, "message": "Registered successfully"})
+                    await websocket.send_json({"type": "register_response", "success": True, "message": "Registered"})
                     continue
 
                 # ========== LOGIN (بدون احراز هویت) ==========
@@ -190,20 +190,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     username = msg.get("username", "").strip()
                     password = msg.get("password", "").strip()
                     if username not in users_db:
-                        await websocket.send_json({"type": "login_response", "success": False, "message": "Invalid credentials"})
+                        await websocket.send_json({"type": "login_response", "success": False, "message": "Invalid"})
                         continue
                     stored = users_db[username]
                     if not bcrypt.checkpw(password.encode(), stored["password_hash"].encode()):
-                        await websocket.send_json({"type": "login_response", "success": False, "message": "Invalid credentials"})
+                        await websocket.send_json({"type": "login_response", "success": False, "message": "Invalid"})
                         continue
-                    # Login successful - generate token
                     payload = {
                         "sub": username,
                         "user_id": stored["user_id"],
                         "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
                     }
                     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-                    # Connect user
                     if username in online_users:
                         old = online_users[username]
                         if old != websocket:
@@ -228,7 +226,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     continue
 
-                # ========== چک کردن احراز هویت برای بقیه پیام‌ها ==========
+                # ========== چک کردن احراز هویت ==========
                 if not current_user:
                     await websocket.send_json({"type": "error", "message": "Not authenticated"})
                     continue
@@ -268,7 +266,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             "subnet": "10.77.0.0"
                         }
                     })
-                    # Broadcast updated room list
                     await manager.broadcast({"type": "room_list", "rooms": []})
 
                 # ========== JOIN ROOM ==========
@@ -332,7 +329,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             break
                     await websocket.send_json({"type": "left_room", "success": True})
 
-                # ========== OFFER (WebRTC Signaling) ==========
+                # ========== OFFER ==========
                 elif t == "offer":
                     target = msg.get("target")
                     sdp = msg.get("sdp")
@@ -358,7 +355,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "sdp": sdp
                         })
 
-                # ========== ICE CANDIDATE ==========
+                # ========== ICE ==========
                 elif t == "ice_candidate":
                     target = msg.get("target")
                     cand = msg.get("candidate")
