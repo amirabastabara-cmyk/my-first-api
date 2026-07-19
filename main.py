@@ -378,7 +378,51 @@ def add_event(username: str, event: dict):
 def broadcast_event(event: dict):
     for username in online_users.keys():
         add_event(username, event)
+#====================
+# ======================== اضافه به main.py ========================
 
+@app.post("/api/rooms/launch")
+async def launch_game(req: dict, username: str = Depends(get_current_user)):
+    """ارسال فرمان لانچ به همه بازیکنان روم"""
+    room_id = req.get("room_id")
+    game = req.get("game")
+    
+    if room_id not in rooms:
+        return {"success": False, "message": "Room not found"}
+    
+    room = rooms[room_id]
+    
+    # ارسال فرمان لانچ به همه بازیکنان (به جز خود هاست)
+    for player in room.get("players", []):
+        if player != username:
+            add_event(player, {
+                "type": "launch_game_command",
+                "data": {"game": game, "room_id": room_id}
+            })
+    
+    return {"success": True}
+
+
+@app.post("/api/game/invite")
+async def game_invite(req: dict, username: str = Depends(get_current_user)):
+    """ارسال دعوت‌نامه به یک بازیکن"""
+    target = req.get("target")
+    game_name = req.get("game_name")
+    room_id = req.get("room_id")
+    
+    if target not in online_users:
+        return {"success": False, "message": "User not online"}
+    
+    add_event(target, {
+        "type": "game_invite",
+        "data": {
+            "sender": username,
+            "game_name": game_name,
+            "room_id": room_id
+        }
+    })
+    
+    return {"success": True}
 # ===== Cleanup =====
 @app.on_event("startup")
 async def startup():
