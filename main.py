@@ -31,20 +31,28 @@ TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 DB_FILE = "users.db"
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            user_id TEXT UNIQUE NOT NULL,
-            created_at INTEGER,
-            last_seen INTEGER
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                user_id TEXT UNIQUE NOT NULL,
+                created_at INTEGER,
+                last_seen INTEGER
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        print("✅ Database initialized")
+    except Exception as e:
+        print(f"❌ Database error: {e}")
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
+            print(f"🗑️ Removed corrupted {DB_FILE}")
+        init_db()
 
 init_db()
 
@@ -97,6 +105,7 @@ class FriendRequest(BaseModel):
 class InviteRequest(BaseModel):
     target: str
     game_name: str
+    room_id: str
 
 class WebRTCOffer(BaseModel):
     target: str
@@ -113,11 +122,11 @@ class WebRTCIce(BaseModel):
     candidate: dict
 
 # ===== State =====
-online_users: Dict[str, dict] = {}  # username -> {"user_id": str, "last_seen": int}
+online_users: Dict[str, dict] = {}
 rooms: Dict[str, dict] = {}
 friendships: Dict[str, set] = {}
 friend_requests: Dict[str, set] = {}
-pending_events: Dict[str, List[dict]] = {}  # username -> list of events
+pending_events: Dict[str, List[dict]] = {}
 
 # ===== JWT =====
 def create_token(username, user_id):
@@ -173,10 +182,7 @@ async def login(req: LoginRequest):
     
     token = create_token(req.username, user_id)
     online_users[req.username] = {"user_id": user_id, "last_seen": int(time.time())}
-    
-    # ارسال رویداد به همه
     broadcast_event({"type": "user_list", "data": {"users": list(online_users.keys())}})
-    
     return {"success": True, "token": token, "user_id": user_id, "username": req.username}
 
 @app.post("/api/auth")
@@ -287,6 +293,35 @@ async def player_ready(room_id: str, username: str = Depends(get_current_user)):
     })
     return {"success": True}
 
+@app.post("/api/rooms/launch")
+async def launch_game(req: dict, username: str = Depends(get_current_user)):
+    room_id = req.get("room_id")
+    game = req.get("game")
+    if room_id not in rooms:
+        return {"success": False, "message": "Room not found"}
+    room = rooms[room_id]
+    for player in room.get("players", []):
+        if player != username:
+            add_event(player, {
+                "type": "launch_game_command",
+                "data": {"game": game, "room_id": room_id}
+            })
+    return {"success": True}
+
+@app.post("/api/game/invite")
+async def game_invite(req: InviteRequest, username: str = Depends(get_current_user)):
+    if req.target not in online_users:
+        return {"success": False, "message": "User not online"}
+    add_event(req.target, {
+        "type": "game_invite",
+        "data": {
+            "sender": username,
+            "game_name": req.game_name,
+            "room_id": req.room_id
+        }
+    })
+    return {"success": True}
+
 @app.post("/api/friends/request")
 async def send_friend_request(req: FriendRequest, username: str = Depends(get_current_user)):
     if req.target not in online_users:
@@ -325,14 +360,6 @@ async def get_friends_list(username: str = Depends(get_current_user)):
 @app.get("/api/friends/requests")
 async def get_friend_requests(username: str = Depends(get_current_user)):
     return {"success": True, "requests": list(friend_requests.get(username, set()))}
-
-@app.post("/api/game/invite")
-async def invite_player(req: InviteRequest, username: str = Depends(get_current_user)):
-    add_event(req.target, {
-        "type": "game_invite",
-        "data": {"sender": username, "game_name": req.game_name}
-    })
-    return {"success": True}
 
 @app.post("/api/webrtc/offer")
 async def webrtc_offer(req: WebRTCOffer, username: str = Depends(get_current_user)):
@@ -378,76 +405,7 @@ def add_event(username: str, event: dict):
 def broadcast_event(event: dict):
     for username in online_users.keys():
         add_event(username, event)
-#=======database=========
-# در main.py، قبل از استفاده از دیتابیس، یک try/except اضافه کنید
-def init_db():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                user_id TEXT UNIQUE NOT NULL,
-                created_at INTEGER,
-                last_seen INTEGER
-            )
-        ''')
-        conn.commit()
-        conn.close()
-        print("✅ Database initialized")
-    except Exception as e:
-        print(f"❌ Database error: {e}")
-        # حذف فایل خراب و ایجاد مجدد
-        if os.path.exists(DB_FILE):
-            os.remove(DB_FILE)
-            print(f"🗑️ Removed corrupted {DB_FILE}")
-        init_db()
-# ======================== اضافه به main.py ========================
 
-@app.post("/api/rooms/launch")
-async def launch_game(req: dict, username: str = Depends(get_current_user)):
-    """ارسال فرمان لانچ به همه بازیکنان روم"""
-    room_id = req.get("room_id")
-    game = req.get("game")
-    
-    if room_id not in rooms:
-        return {"success": False, "message": "Room not found"}
-    
-    room = rooms[room_id]
-    
-    # ارسال فرمان لانچ به همه بازیکنان (به جز خود هاست)
-    for player in room.get("players", []):
-        if player != username:
-            add_event(player, {
-                "type": "launch_game_command",
-                "data": {"game": game, "room_id": room_id}
-            })
-    
-    return {"success": True}
-
-
-@app.post("/api/game/invite")
-async def game_invite(req: dict, username: str = Depends(get_current_user)):
-    """ارسال دعوت‌نامه به یک بازیکن"""
-    target = req.get("target")
-    game_name = req.get("game_name")
-    room_id = req.get("room_id")
-    
-    if target not in online_users:
-        return {"success": False, "message": "User not online"}
-    
-    add_event(target, {
-        "type": "game_invite",
-        "data": {
-            "sender": username,
-            "game_name": game_name,
-            "room_id": room_id
-        }
-    })
-    
-    return {"success": True}
 # ===== Cleanup =====
 @app.on_event("startup")
 async def startup():
