@@ -9,9 +9,14 @@ import time
 import asyncio
 import socket
 import struct
+import logging
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+
+# ===== تنظیمات لاگ =====
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("voidvision-server")
 
 app = FastAPI(title="VoidVision Server")
 
@@ -47,6 +52,7 @@ def init_db():
     ''')
     conn.commit()
     conn.close()
+    logger.info("✅ Database initialized")
 
 init_db()
 
@@ -68,24 +74,34 @@ def register_user(username, password, public_ip="", nat_type="Unknown"):
         return {"success": True, "user_id": user_id}
     except sqlite3.IntegrityError:
         return {"success": False, "message": "Username already exists"}
+    except Exception as e:
+        logger.error(f"Register error: {e}")
+        return {"success": False, "message": str(e)}
 
 def login_user(username, password):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('SELECT password_hash, user_id FROM users WHERE username = ?', (username,))
-    result = c.fetchone()
-    conn.close()
-    if result and result[0] == hash_password(password):
-        return {"success": True, "user_id": result[1]}
-    return {"success": False, "message": "Invalid credentials"}
+    try:
+        conn = sqlite3.connect('users.db')
+        c = conn.cursor()
+        c.execute('SELECT password_hash, user_id FROM users WHERE username = ?', (username,))
+        result = c.fetchone()
+        conn.close()
+        if result and result[0] == hash_password(password):
+            return {"success": True, "user_id": result[1]}
+        return {"success": False, "message": "Invalid credentials"}
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        return {"success": False, "message": str(e)}
 
 def user_exists(username):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('SELECT 1 FROM users WHERE username = ?', (username,))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
+    try:
+        conn = sqlite3.connect('users.db')
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM users WHERE username = ?', (username,))
+        result = c.fetchone()
+        conn.close()
+        return result is not None
+    except:
+        return False
 
 def update_user_last_seen(username, public_ip, nat_type):
     try:
@@ -98,7 +114,8 @@ def update_user_last_seen(username, public_ip, nat_type):
         conn.commit()
         conn.close()
         return True
-    except:
+    except Exception as e:
+        logger.error(f"Update user error: {e}")
         return False
 
 # ================== JWT ==================
@@ -113,14 +130,18 @@ def create_token(username, user_id):
 def verify_token(token):
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except:
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+    except Exception as e:
+        logger.error(f"Token verify error: {e}")
         return None
 
 # ================== NAT Type Detection ==================
 def detect_nat_type(ip, port):
     """تشخیص نوع NAT با استفاده از STUN-like mechanism"""
     try:
-        # Simple NAT detection using socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(2)
         sock.connect(('stun.cloudflare.com', 3478))
@@ -175,7 +196,9 @@ async def root():
         "message": "VoidVision Server is running!",
         "version": "2.0",
         "status": "online",
-        "turn_servers": get_turn_servers()
+        "turn_servers": get_turn_servers(),
+        "online_users": len(connected_users),
+        "rooms": len(rooms)
     }
 
 @app.get("/api/turn")
@@ -199,11 +222,18 @@ async def websocket_endpoint(websocket: WebSocket):
     current_user = None
     try:
         while True:
-            data = await websocket.receive_text()
+            try:
+                data = await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"WebSocket receive error: {e}")
+                break
+
             try:
                 msg = json.loads(data)
                 msg_type = msg.get("type")
-                client_ip = websocket.client.host if hasattr(websocket, 'client') else "unknown"
+                client_ip = websocket.client.host if hasattr(websocket, 'client') and websocket.client else "unknown"
                 nat_type = detect_nat_type(client_ip, 0)
 
                 # ========== REGISTER ==========
@@ -524,7 +554,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # ========== FRIEND REQUEST ==========
                 if msg_type == "friend_request":
                     target = msg.get("target")
-                    if target and target in user_data:
+                    if target and target in user_data and target in connected_users:
                         await connected_users[target].send_text(json.dumps({
                             "type": "friend_request_received",
                             "from": current_user
@@ -534,7 +564,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # ========== FRIEND ACCEPT ==========
                 if msg_type == "friend_accept":
                     target = msg.get("target")
-                    if target and target in user_data:
+                    if target and target in user_data and target in connected_users:
                         await connected_users[target].send_text(json.dumps({
                             "type": "friend_accepted",
                             "from": current_user
@@ -549,6 +579,30 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
                     continue
 
+                # ========== PLAYER READY ==========
+                if msg_type == "player_ready":
+                    room_id = msg.get("room_id")
+                    if room_id and room_id in rooms:
+                        await broadcast({
+                            "type": "player_ready",
+                            "player": current_user,
+                            "room_id": room_id
+                        })
+                    continue
+
+                # ========== LAUNCH GAME COMMAND ==========
+                if msg_type == "launch_game_command":
+                    game = msg.get("game", "")
+                    room_id = msg.get("room_id")
+                    if room_id and room_id in rooms:
+                        await broadcast({
+                            "type": "launch_game_command",
+                            "game": game,
+                            "room_id": room_id,
+                            "sender": current_user
+                        }, exclude=current_user)
+                    continue
+
                 # ========== UNKNOWN ==========
                 await websocket.send_text(json.dumps({
                     "type": "error",
@@ -561,14 +615,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     "message": "Invalid JSON"
                 }))
             except Exception as e:
-                logger.error(f"Error: {e}")
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": str(e)
-                }))
+                logger.error(f"Error processing message: {e}")
+                try:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": str(e)
+                    }))
+                except:
+                    pass
 
     except WebSocketDisconnect:
         pass
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
     finally:
         if current_user and current_user in connected_users:
             del connected_users[current_user]
@@ -590,8 +649,8 @@ async def broadcast(data, exclude=None):
         if name != exclude:
             try:
                 await ws.send_text(json.dumps(data))
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Broadcast to {name} failed: {e}")
 
 async def broadcast_user_list():
     await broadcast({
@@ -632,35 +691,37 @@ async def broadcast_room_players(room_id):
 async def cleanup_users():
     """پاک کردن کاربران قدیمی از دیتابیس"""
     while True:
-        await asyncio.sleep(3600)  # هر یک ساعت
         try:
+            await asyncio.sleep(3600)  # هر یک ساعت
             conn = sqlite3.connect('users.db')
             c = conn.cursor()
             # حذف کاربرانی که بیش از 30 روز قبل آخرین بار دیده شده‌اند
             c.execute('DELETE FROM users WHERE last_seen < ?', (int(time.time()) - 2592000,))
             conn.commit()
             conn.close()
-        except:
-            pass
+            logger.info("🧹 Cleaned old users from database")
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
 
 # ================== Entry ==================
 if __name__ == "__main__":
     import uvicorn
     import os
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
     
-    # Start cleanup task
-    import asyncio
+    # Start cleanup task in background
     try:
         loop = asyncio.get_event_loop()
-    except:
+    except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     
-    logger = logging.getLogger("uvicorn")
+    # Run cleanup in background
+    asyncio.create_task(cleanup_users())
+    
     logger.info(f"🚀 VoidVision Server starting on port {port}")
     logger.info(f"🌐 WebSocket endpoint: ws://0.0.0.0:{port}/ws")
     logger.info(f"📡 TURN/STUN servers available")
+    logger.info(f"📊 Online users: {len(connected_users)}")
     
     uvicorn.run(app, host="0.0.0.0", port=port)
