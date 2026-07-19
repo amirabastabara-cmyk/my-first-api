@@ -1,4 +1,4 @@
-# main.py - VoidVision Server (Full WebSocket + JWT + NAT Traversal)
+# main.py - VoidVision Server (برای VPS شخصی)
 import os
 import json
 import sqlite3
@@ -8,7 +8,6 @@ import jwt
 import time
 import asyncio
 import socket
-import struct
 import logging
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -18,9 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voidvision-server")
 
-app = FastAPI(title="VoidVision Server")
+app = FastAPI(title="VoidVision Server", version="2.0")
 
-# CORS - اجازه دسترسی از همه جا
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,9 +29,9 @@ app.add_middleware(
 )
 
 # ================== Config ==================
-JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-on-render")
+JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-on-vps")
 JWT_ALGORITHM = "HS256"
-TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 
 # ================== Database ==================
 def init_db():
@@ -140,7 +139,6 @@ def verify_token(token):
 
 # ================== NAT Type Detection ==================
 def detect_nat_type(ip, port):
-    """تشخیص نوع NAT با استفاده از STUN-like mechanism"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(2)
@@ -153,42 +151,35 @@ def detect_nat_type(ip, port):
     except:
         return "Unknown"
 
-# ================== TURN/STUN Helper ==================
-def get_turn_servers():
-    """بازگرداندن لیست TURN/STUN سرورها"""
-    return [
-        {
-            "urls": ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443", "turn:openrelay.metered.ca:5349"],
-            "username": "openrelayproject",
-            "credential": "openrelayproject"
-        },
-        {
-            "urls": ["turn:turn.anyfirewall.com:3478"],
-            "username": "anyfirewall",
-            "credential": "anyfirewall"
-        },
-        {
-            "urls": ["stun:stun.cloudflare.com:3478"],
-            "username": "",
-            "credential": ""
-        },
-        {
-            "urls": ["stun:stun.l.google.com:19302"],
-            "username": "",
-            "credential": ""
-        },
-        {
-            "urls": ["stun:stun.stunprotocol.org:3478"],
-            "username": "",
-            "credential": ""
-        }
-    ]
-
 # ================== WebSocket ==================
-connected_users = {}  # username -> websocket
-user_data = {}        # username -> {"user_id": str, "token": str}
-rooms = {}            # room_id -> {"name": str, "password": str, "host": str, "players": list, "ips": dict, "room_key": str}
-room_counter = 0
+connected_users = {}
+user_data = {}
+rooms = {}
+
+# STUN Servers
+STUN_SERVERS = [
+    "stun.l.google.com:19302",
+    "stun1.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+    "stun.stunprotocol.org:3478",
+]
+
+# TURN Servers
+TURN_SERVERS = [
+    {
+        "urls": ["turn:openrelay.metered.ca:80?transport=udp", "turn:openrelay.metered.ca:443?transport=tcp"],
+        "username": "openrelayproject",
+        "credential": "openrelayproject"
+    },
+    {
+        "urls": ["turn:turn.anyfirewall.com:3478?transport=udp", "turn:turn.anyfirewall.com:3478?transport=tcp"],
+        "username": "anyfirewall",
+        "credential": "anyfirewall"
+    }
+]
+
+def get_turn_servers():
+    return TURN_SERVERS + [{"urls": [f"stun:{s}"], "username": "", "credential": ""} for s in STUN_SERVERS]
 
 @app.get("/")
 async def root():
@@ -203,10 +194,7 @@ async def root():
 
 @app.get("/api/turn")
 async def get_turn_config():
-    """Endpoint برای دریافت تنظیمات TURN/STUN"""
-    return {
-        "iceServers": get_turn_servers()
-    }
+    return {"iceServers": get_turn_servers()}
 
 @app.get("/api/status")
 async def server_status():
@@ -274,7 +262,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             "message": result.get("message", "Invalid credentials")
                         }))
                         continue
-                    # Remove old connection if any
                     if username in connected_users:
                         try:
                             await connected_users[username].close()
@@ -285,10 +272,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     user_data[username] = {"user_id": result["user_id"], "token": token}
                     connected_users[username] = websocket
                     current_user = username
-                    
-                    # Update last seen and NAT info
                     update_user_last_seen(username, client_ip, nat_type)
-                    
                     await websocket.send_text(json.dumps({
                         "type": "login_response",
                         "success": True,
@@ -298,7 +282,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         "nat_type": nat_type,
                         "turn_servers": get_turn_servers()
                     }))
-                    # Broadcast user list
                     await broadcast_user_list()
                     continue
 
@@ -338,9 +321,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     connected_users[username] = websocket
                     user_data[username] = {"user_id": user_id, "token": token}
                     current_user = username
-                    
                     update_user_last_seen(username, client_ip, nat_type)
-                    
                     await websocket.send_text(json.dumps({
                         "type": "auth_response",
                         "success": True,
@@ -377,24 +358,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             "sender": current_user,
                             "message": text
                         }, exclude=current_user)
-                    continue
-
-                # ========== GAME INVITE ==========
-                if msg_type == "game_invite":
-                    target = msg.get("target")
-                    game_name = msg.get("game_name", "Unknown Game")
-                    ip = msg.get("ip", "")
-                    port = msg.get("port", 0)
-                    if target and target in connected_users:
-                        await connected_users[target].send_text(json.dumps({
-                            "type": "game_invite",
-                            "sender": current_user,
-                            "game_name": game_name,
-                            "ip": ip,
-                            "port": port,
-                            "nat_type": nat_type,
-                            "turn_servers": get_turn_servers()
-                        }))
                     continue
 
                 # ========== ROOM LIST ==========
@@ -571,14 +534,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         }))
                     continue
 
-                # ========== GET TURN ==========
-                if msg_type == "get_turn":
-                    await websocket.send_text(json.dumps({
-                        "type": "turn_response",
-                        "turn_servers": get_turn_servers()
-                    }))
-                    continue
-
                 # ========== PLAYER READY ==========
                 if msg_type == "player_ready":
                     room_id = msg.get("room_id")
@@ -601,6 +556,14 @@ async def websocket_endpoint(websocket: WebSocket):
                             "room_id": room_id,
                             "sender": current_user
                         }, exclude=current_user)
+                    continue
+
+                # ========== GET TURN ==========
+                if msg_type == "get_turn":
+                    await websocket.send_text(json.dumps({
+                        "type": "turn_response",
+                        "turn_servers": get_turn_servers()
+                    }))
                     continue
 
                 # ========== UNKNOWN ==========
@@ -632,7 +595,6 @@ async def websocket_endpoint(websocket: WebSocket):
         if current_user and current_user in connected_users:
             del connected_users[current_user]
             await broadcast_user_list()
-            # Remove from rooms
             for rid, room in list(rooms.items()):
                 if current_user in room["players"]:
                     room["players"].remove(current_user)
@@ -687,19 +649,17 @@ async def broadcast_room_players(room_id):
         "turn_servers": get_turn_servers()
     })
 
-# ================== Cleanup old users ==================
+# ================== Cleanup ==================
 async def cleanup_users():
-    """پاک کردن کاربران قدیمی از دیتابیس"""
     while True:
         try:
-            await asyncio.sleep(3600)  # هر یک ساعت
+            await asyncio.sleep(3600)
             conn = sqlite3.connect('users.db')
             c = conn.cursor()
-            # حذف کاربرانی که بیش از 30 روز قبل آخرین بار دیده شده‌اند
             c.execute('DELETE FROM users WHERE last_seen < ?', (int(time.time()) - 2592000,))
             conn.commit()
             conn.close()
-            logger.info("🧹 Cleaned old users from database")
+            logger.info("🧹 Cleaned old users")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
 
@@ -709,19 +669,17 @@ if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 8000))
     
-    # Start cleanup task in background
+    # Start cleanup
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     
-    # Run cleanup in background
     asyncio.create_task(cleanup_users())
     
     logger.info(f"🚀 VoidVision Server starting on port {port}")
     logger.info(f"🌐 WebSocket endpoint: ws://0.0.0.0:{port}/ws")
     logger.info(f"📡 TURN/STUN servers available")
-    logger.info(f"📊 Online users: {len(connected_users)}")
     
     uvicorn.run(app, host="0.0.0.0", port=port)
