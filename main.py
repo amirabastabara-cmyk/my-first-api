@@ -378,7 +378,32 @@ def add_event(username: str, event: dict):
 def broadcast_event(event: dict):
     for username in online_users.keys():
         add_event(username, event)
-#====================
+#=======database=========
+# در main.py، قبل از استفاده از دیتابیس، یک try/except اضافه کنید
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                user_id TEXT UNIQUE NOT NULL,
+                created_at INTEGER,
+                last_seen INTEGER
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        print("✅ Database initialized")
+    except Exception as e:
+        print(f"❌ Database error: {e}")
+        # حذف فایل خراب و ایجاد مجدد
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
+            print(f"🗑️ Removed corrupted {DB_FILE}")
+        init_db()
 # ======================== اضافه به main.py ========================
 
 @app.post("/api/rooms/launch")
