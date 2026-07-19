@@ -1,6 +1,7 @@
+PySide6
+requests
+keyboard
 fastapi
 uvicorn
 python-jose[cryptography]
 pyjwt
-websockets
-requests
